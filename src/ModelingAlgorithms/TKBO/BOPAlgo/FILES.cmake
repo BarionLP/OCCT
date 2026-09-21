@@ -56,6 +56,7 @@ set(OCCT_BOPAlgo_FILES
   BOPAlgo_PaveFiller_11.cxx
   BOPAlgo_RemoveFeatures.cxx
   BOPAlgo_RemoveFeatures.hxx
+  BOPAlgo_RemoveFeatures_FillGap.pxx
   BOPAlgo_Section.cxx
   BOPAlgo_Section.hxx
   BOPAlgo_SectionAttribute.hxx
