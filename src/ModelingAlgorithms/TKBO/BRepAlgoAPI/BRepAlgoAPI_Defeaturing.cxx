@@ -29,6 +29,7 @@ void BRepAlgoAPI_Defeaturing::Build(const Message_ProgressRange& theRange)
   myFeatureRemovalTool.AddFacesToRemove(myFacesToRemove);
   myFeatureRemovalTool.SetToFillHistory(myFillHistory);
   myFeatureRemovalTool.SetRunParallel(myRunParallel);
+  myFeatureRemovalTool.SetFuzzyValue(myFuzzyValue);
 
   // Perform the features removal
   myFeatureRemovalTool.Perform(theRange);

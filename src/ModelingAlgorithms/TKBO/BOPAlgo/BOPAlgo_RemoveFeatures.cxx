@@ -382,6 +382,7 @@ public: //! @name Constructors
   //! Empty constructor
   FillGap()
       : myRunParallel(false),
+        myFuzzyValue(0.0),
         myHasAdjacentFaces(false),
         myTrimDegenerated(false),
         myTrimFailed(false),
@@ -418,6 +419,9 @@ public: //! @name Setters/Getters
 
   //! Defines the parallel processing mode
   void SetRunParallel(const bool bRunParallel) { myRunParallel = bRunParallel; }
+
+  //! Sets the fuzzy value for the intersections
+  void SetFuzzyValue(const double theFuzz) { myFuzzyValue = theFuzz; }
 
   //! Gets the History object
   const occ::handle<BRepTools_History>& History() { return myHistory; }
@@ -716,6 +720,7 @@ private: //! @name Private methods performing the operation
     }
 
     aGFInter.SetRunParallel(myRunParallel);
+    aGFInter.SetFuzzyValue(myFuzzyValue);
 
     // Intersection result
     TopoDS_Shape          anIntResult;
@@ -857,6 +862,7 @@ private: //! @name Private methods performing the operation
     // Avoid faces intersection
     aGFTrim.SetGlue(BOPAlgo_GlueShift);
     aGFTrim.SetRunParallel(myRunParallel);
+    aGFTrim.SetFuzzyValue(myFuzzyValue);
     aGFTrim.SetNonDestructive(true);
 
     aGFTrim.Perform();
@@ -1042,6 +1048,7 @@ private: //! @name Fields
   // Inputs
   // clang-format off
   bool myRunParallel;                     //!< Defines the mode of processing of the single feature
+  double myFuzzyValue;                    //!< Fuzzy value for the intersections
   TopoDS_Shape myFeature;                             //!< Feature to remove
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myEFMap; //!< EF Connection map to find adjacent faces
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myFSMap; //!< FS Connection map to find solids participating in the feature removal
@@ -1107,6 +1114,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     aFG.SetEFConnectionMap(anEFMap);
     aFG.SetFSConnectionMap(anFSMap);
     aFG.SetRunParallel(myRunParallel);
+    aFG.SetFuzzyValue(myFuzzyValue);
   }
 
   const int             aNbF = aVFG.Length();
@@ -1250,6 +1258,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   // Tool for solids reconstruction
   BOPAlgo_MakerVolume aMV;
   aMV.SetRunParallel(myRunParallel);
+  aMV.SetFuzzyValue(myFuzzyValue);
   aMV.SetAvoidInternalShapes(true);
   aMV.SetIntersect(bFuseShapes);
   aMV.SetNonDestructive(true);

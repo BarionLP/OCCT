@@ -2948,7 +2948,8 @@ The Defeaturing algorithm has the following options:
 
 and the options available from base class (*BOPAlgo_Options*):
 * Error/Warning reporting system;
-* Parallel processing mode.
+* Parallel processing mode;
+* Fuzzy tolerance.
 
 Note that the other options of the base class are not supported here and will have no effect.
 
@@ -2964,6 +2965,8 @@ On the low-level the history information is collected by the history tool *BRepT
 For more information on the error/warning reporting system, see the chapter @ref specification__boolean_ers "Errors and warnings reporting system" of Boolean operations user guide.
 
 <b>Parallel processing mode</b> - allows running the algorithm in parallel mode obtaining the result faster.
+
+<b>Fuzzy tolerance</b> - the additional tolerance applied to all the intersections performed by the algorithm: the intersection of the extended adjacent faces, their trimming by the bounds of the original faces and the reconstruction of the solids. It allows the algorithm to detect the touching or coinciding cases in the models built with a loose tolerance.
 
 The algorithm has certain limitations:
 * Intersection of the surfaces of the connected faces adjacent to the feature should not be empty. It means, that such faces should not be tangent to each other. 

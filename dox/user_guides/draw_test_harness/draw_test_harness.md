@@ -6592,6 +6592,8 @@ Options:
 nohist   - disables the history collection;
 parallel - enables the parallel processing mode.
 
+The fuzzy value set by the command **bfuzzyvalue** is used for all the intersections performed by the operation.
+
 
 
 @subsection occt_draw_makeperiodic 3D Model Periodicity

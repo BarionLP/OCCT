@@ -97,6 +97,7 @@ int RemoveFeatures(Draw_Interpretor& theDI, int theArgc, const char** theArgv)
   }
 
   aRF.SetToFillHistory(BRepTest_Objects::IsHistoryNeeded());
+  aRF.SetFuzzyValue(BOPTest_Objects::FuzzyValue());
   occ::handle<Draw_ProgressIndicator> aProgress = new Draw_ProgressIndicator(theDI, 1);
   // Perform the removal
   aRF.Build(aProgress->Start());

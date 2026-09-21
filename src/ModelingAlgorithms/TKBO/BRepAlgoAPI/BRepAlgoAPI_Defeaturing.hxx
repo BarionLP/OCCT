@@ -50,7 +50,8 @@
 //!
 //! and the options available from base class:
 //! - Error/Warning reporting system;
-//! - Parallel processing mode.
+//! - Parallel processing mode;
+//! - Fuzzy tolerance.
 //!
 //! Please note that the other options of the base class are not supported
 //! here and will have no effect.
