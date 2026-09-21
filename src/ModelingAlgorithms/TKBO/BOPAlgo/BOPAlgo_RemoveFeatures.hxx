@@ -110,10 +110,13 @@
 //! cases in the models built with a loose tolerance.
 //!
 //! The algorithm has certain limitations:
-//! - Intersection of the connected faces adjacent to the feature should not be empty.
-//!   It means, that such faces should not be tangent to each other.
-//!   If the intersection of the adjacent faces will be empty, the algorithm will
-//!   be unable to trim the faces correctly and, most likely, the feature will not be removed.
+//! - The intersection of the extended adjacent faces cannot provide the boundary
+//!   between two adjacent faces tangent to each other. Such a boundary is recovered
+//!   from the edge the faces share when the feature cuts that edge: exactly when both
+//!   pieces of the edge are left, by the extension of the remaining piece otherwise,
+//!   which is a guess that may fail where several such boundaries meet under the
+//!   feature. Tangent adjacent faces sharing no edge cut by the feature are likely
+//!   to prevent the removal of the feature.
 //! - The algorithm does not process the INTERNAL parts of the solids, they are simply
 //!   removed during reconstruction.
 //!

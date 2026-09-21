@@ -37,20 +37,27 @@
 
 #include <BRepBndLib.hxx>
 
+#include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+
 #include <BRepLib.hxx>
 #include <BRepLib_MakeFace.hxx>
 #include <BRepTools.hxx>
 
 #include <ElCLib.hxx>
 
+#include <Geom_Curve.hxx>
 #include <Geom_RectangularTrimmedSurface.hxx>
 #include <Geom_Surface.hxx>
 #include <Geom2d_Curve.hxx>
+#include <Geom2d_Line.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomConvert_SurfToAnaSurf.hxx>
 
 #include <Geom2d_Curve.hxx>
 
+#include <NCollection_Array1.hxx>
+#include <NCollection_DataMap.hxx>
 #include <NCollection_DynamicArray.hxx>
 
 #include <ShapeUpgrade_UnifySameDomain.hxx>
@@ -397,6 +404,28 @@ void BOPAlgo_RemoveFeatures::PrepareFeatures(const Message_ProgressRange& theRan
 //=======================================================================
 class FillGap
 {
+private: //! @name Auxiliary types
+  //! Two adjacent faces tangent to each other along a common edge
+  struct TangentPair
+  {
+    TopoDS_Face Face1;
+    TopoDS_Face Face2;
+    int         NbOpenEnds; //!< number of ends of the common edges cut off by the feature
+    int         NbClosed;   //!< number of ends reconnected along their curves
+    int         NbExtended; //!< number of ends extended into the gap
+  };
+
+  //! An end of an edge shared by two tangent adjacent faces, cut off by the feature
+  struct OpenEnd
+  {
+    TopoDS_Edge   Edge;
+    TopoDS_Vertex Vertex;    //!< the vertex lying on the feature
+    double        Param;     //!< parameter of the vertex on the curve of the edge
+    bool          IsForward; //!< the feature lies at the increasing parameters
+    int           Pair;      //!< index of the pair of faces in myTangentPairs
+    bool          IsDone;    //!< the boundary has been recovered from this end
+  };
+
 public: //! @name Constructors
   //! Empty constructor
   FillGap()
@@ -477,6 +506,9 @@ public: //! @name Perform the operation
       // Map the edges of the feature to avoid them during the trim
       TopExp::MapShapes(myFeature, TopAbs_EDGE, myFeatureEdgesMap);
 
+      // Find the adjacent faces tangent to each other along the edges cut by the feature
+      FindTangentPairs(aMFAdjacent);
+
       // Most features (holes, pockets, bosses) lie within the parametric domains of the
       // adjacent faces, so the faces are first rebuilt over their domains without any
       // extension. If the trim of some face degenerates, the faces are extended by the
@@ -520,14 +552,7 @@ public: //! @name Perform the operation
       Message_ProgressScope aPSExt(aPS.Next(2), nullptr, aNbAttempts);
       for (int anAttempt = 0; anAttempt < aNbAttempts; ++anAttempt)
       {
-        myTrimDegenerated = false;
-        myTrimFailed      = false;
-        myNbDegenerated   = 0;
-        myFaces.Clear();
-        myAnchoredFaces.Clear();
-        myHistory = new BRepTools_History();
-
-        Message_ProgressScope aPSAttempt(aPSExt.Next(), nullptr, 2);
+        Message_ProgressScope aPSAttempt(aPSExt.Next(), nullptr, 3);
 
         // No extension on the first attempt, then doubling from the size of the feature
         const double anExtLength = (anAttempt == 0) ? 0.0 : std::ldexp(aFeatureSize, anAttempt - 1);
@@ -535,29 +560,54 @@ public: //! @name Perform the operation
         // Extend the adjacent faces keeping the connection to the original faces
         NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>
           aFaceExtFaceMap;
+        myHistory = new BRepTools_History();
         ExtendAdjacentFaces(aMFAdjacent, anExtLength, aFaceExtFaceMap, aPSAttempt.Next());
         if (!aPSAttempt.More())
         {
           return;
         }
+        const occ::handle<BRepTools_History> anExtHistory = myHistory;
 
-        // Trim the extended faces
-        TrimExtendedFaces(aFaceExtFaceMap, aPSAttempt.Next());
+        // Recover the boundaries between the tangent adjacent faces
+        RecoverTangentBoundaries(aFaceExtFaceMap, aFeatureBox, std::ldexp(aFeatureSize, anAttempt));
 
-        // The reconstruction is complete when every adjacent face has been trimmed by
-        // the bounds of its original face. Otherwise it is rated by the number of the
-        // faces trimmed that way: the faces that could not be trimmed at all are left
-        // out of the reconstruction, the faces whose trim degenerated are kept
-        // untrimmed, and either kind makes the rebuilt solids invalid.
-        const bool isComplete =
-          !myTrimFailed && !myTrimDegenerated && myFaces.Extent() == aMFAdjacent.Extent();
-        const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
-        if (isComplete || aQuality > aBestQuality)
+        // Trim the extended faces. The tangent faces are not intersected with each other
+        // at first; if the reconstruction is not complete and some of their boundaries
+        // were guessed by the extension of a single end, the trim is repeated with these
+        // faces intersected as well.
+        bool isComplete = false;
+        for (int aPass = 0; aPass < 2 && !isComplete; ++aPass)
         {
-          aBestQuality   = aQuality;
-          aFacesBest     = myFaces;
-          anAnchoredBest = myAnchoredFaces;
-          aHistoryBest   = myHistory;
+          if (aPass == 1 && (myTrimFailed || !HasExtendedTangentBoundaries()))
+          {
+            break;
+          }
+
+          myTrimDegenerated = false;
+          myTrimFailed      = false;
+          myNbDegenerated   = 0;
+          myFaces.Clear();
+          myAnchoredFaces.Clear();
+          myHistory = new BRepTools_History();
+          myHistory->Merge(anExtHistory);
+
+          TrimExtendedFaces(aFaceExtFaceMap, aPass == 1, aPSAttempt.Next());
+
+          // The reconstruction is complete when every adjacent face has been trimmed by
+          // the bounds of its original face. Otherwise it is rated by the number of the
+          // faces trimmed that way: the faces that could not be trimmed at all are left
+          // out of the reconstruction, the faces whose trim degenerated are kept
+          // untrimmed, and either kind makes the rebuilt solids invalid.
+          isComplete =
+            !myTrimFailed && !myTrimDegenerated && myFaces.Extent() == aMFAdjacent.Extent();
+          const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
+          if (isComplete || aQuality > aBestQuality)
+          {
+            aBestQuality   = aQuality;
+            aFacesBest     = myFaces;
+            anAnchoredBest = myAnchoredFaces;
+            aHistoryBest   = myHistory;
+          }
         }
 
         if (isComplete)
@@ -1151,23 +1201,551 @@ private: //! @name Private methods performing the operation
     }
   }
 
+  //! Finds the pairs of adjacent faces tangent to each other along a common edge and
+  //! the ends of such edges cut off by the feature. The intersection of the extensions
+  //! of tangent faces cannot provide their common boundary inside the gap, so it is
+  //! recovered from these edges instead (see RecoverTangentBoundaries).
+  void FindTangentPairs(
+    const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theMFAdjacent)
+  {
+    myTangentPairs.Clear();
+    myOpenEnds.Clear();
+
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aFeatureVertices;
+    TopExp::MapShapes(myFeature, TopAbs_VERTEX, aFeatureVertices);
+
+    const int aNbFA = theMFAdjacent.Extent();
+    for (int i = 1; i <= aNbFA; ++i)
+    {
+      const TopoDS_Face& aF = TopoDS::Face(theMFAdjacent(i));
+      TopExp_Explorer    anExpE(aF, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+        if (myFeatureEdgesMap.Contains(aE) || BRep_Tool::Degenerated(aE))
+        {
+          continue;
+        }
+        const NCollection_List<TopoDS_Shape>* pLF = myEFMap->Seek(aE);
+        if (!pLF)
+        {
+          continue;
+        }
+        // Look for another adjacent face sharing the edge
+        NCollection_List<TopoDS_Shape>::Iterator itLF(*pLF);
+        for (; itLF.More(); itLF.Next())
+        {
+          const TopoDS_Face& aFOther = TopoDS::Face(itLF.Value());
+          if (theMFAdjacent.FindIndex(aFOther) <= i || !AreTangent(aE, aF, aFOther))
+          {
+            continue;
+          }
+
+          const int aPair = myTangentPairs.Length();
+          myTangentPairs.Append(TangentPair{aF, aFOther, 0, 0, 0});
+
+          // The ends of the edge lying on the feature
+          TopoDS_Vertex aV1, aV2;
+          TopExp::Vertices(TopoDS::Edge(aE.Oriented(TopAbs_FORWARD)), aV1, aV2);
+          double aFirst, aLast;
+          BRep_Tool::Range(aE, aFirst, aLast);
+          if (!aV1.IsNull() && aFeatureVertices.Contains(aV1))
+          {
+            myOpenEnds.Append(OpenEnd{aE, aV1, aFirst, false, aPair, false});
+          }
+          if (!aV2.IsNull() && aFeatureVertices.Contains(aV2))
+          {
+            myOpenEnds.Append(OpenEnd{aE, aV2, aLast, true, aPair, false});
+          }
+        }
+      }
+    }
+  }
+
+  //! Checks whether the faces are tangent to each other along their common edge: the
+  //! edge carries the continuity flag, or the normals to the faces measured in the
+  //! middle of the edge make an angle smaller than THE_TANGENT_ANGLE.
+  static bool AreTangent(const TopoDS_Edge& theE,
+                         const TopoDS_Face& theF1,
+                         const TopoDS_Face& theF2)
+  {
+    if (BRep_Tool::Continuity(theE, theF1, theF2) >= GeomAbs_G1)
+    {
+      return true;
+    }
+    gp_Pnt aP1, aP2;
+    gp_Dir aDN1, aDN2;
+    return NormalToFaceOnEdge(theE, theF1, aP1, aDN1) && NormalToFaceOnEdge(theE, theF2, aP2, aDN2)
+           && aDN1.Angle(aDN2) < THE_TANGENT_ANGLE;
+  }
+
+  //! Recovers the boundaries between the tangent adjacent faces inside the gap from the
+  //! ends of their common edges cut off by the feature: two ends facing each other on
+  //! one and the same curve are reconnected along it, a single end is extended along
+  //! the curve until it leaves the box of the feature, but not further than the given
+  //! length. The recovered edges are stored as additional trimming tools of the
+  //! extended faces of both faces of the pair.
+  void RecoverTangentBoundaries(
+    const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
+                   theFaceExtFaceMap,
+    const Bnd_Box& theFeatureBox,
+    const double   theMaxLength)
+  {
+    myTrimEdges.Clear();
+    for (int i = 0; i < myTangentPairs.Length(); ++i)
+    {
+      myTangentPairs(i).NbOpenEnds = myTangentPairs(i).NbClosed = myTangentPairs(i).NbExtended = 0;
+    }
+    for (int i = 0; i < myOpenEnds.Length(); ++i)
+    {
+      ++myTangentPairs(myOpenEnds(i).Pair).NbOpenEnds;
+    }
+
+    const int aNbEnds = myOpenEnds.Length();
+    for (int i = 0; i < aNbEnds; ++i)
+    {
+      myOpenEnds(i).IsDone = false;
+    }
+
+    // Reconnect the pairs of ends facing each other on the same curve: for each end
+    // looking forward take the nearest end looking backward
+    for (int i = 0; i < aNbEnds; ++i)
+    {
+      OpenEnd& aStart = myOpenEnds(i);
+      if (aStart.IsDone || !aStart.IsForward)
+      {
+        continue;
+      }
+      int         aStop = -1;
+      TopoDS_Edge aClosing;
+      for (int j = 0; j < aNbEnds; ++j)
+      {
+        const OpenEnd& anEnd = myOpenEnds(j);
+        if (anEnd.IsDone || anEnd.IsForward
+            || (aStop >= 0 && anEnd.Param >= myOpenEnds(aStop).Param)
+            || !IsSamePair(aStart.Pair, anEnd.Pair, theFaceExtFaceMap))
+        {
+          continue;
+        }
+        TopoDS_Edge anEdge;
+        if (MakeClosingEdge(aStart, anEnd, anEdge))
+        {
+          aStop    = j;
+          aClosing = anEdge;
+        }
+      }
+      if (aStop >= 0)
+      {
+        AddTrimEdge(aStart.Pair, theFaceExtFaceMap, aClosing);
+        ++myTangentPairs(aStart.Pair).NbClosed;
+        ++myTangentPairs(myOpenEnds(aStop).Pair).NbClosed;
+        aStart.IsDone = myOpenEnds(aStop).IsDone = true;
+      }
+    }
+
+    // Extend the remaining ends
+    for (int i = 0; i < aNbEnds; ++i)
+    {
+      OpenEnd& anEnd = myOpenEnds(i);
+      if (anEnd.IsDone)
+      {
+        continue;
+      }
+      // Carry the extension by the face on which the edge is the straightest in the
+      // parametric space (an iso-line of a blend rather than an arc on a plane): its
+      // straight continuation is the natural continuation of the boundary.
+      const TangentPair& aPair     = myTangentPairs(anEnd.Pair);
+      TopoDS_Face        aFCarrier = aPair.Face1;
+      TopoDS_Face        aFOther   = aPair.Face2;
+      if (PCurveTurn(anEnd, aFOther) < PCurveTurn(anEnd, aFCarrier))
+      {
+        std::swap(aFCarrier, aFOther);
+      }
+      const TopoDS_Shape* pFCarrierExt = theFaceExtFaceMap.Seek(aFCarrier);
+      const TopoDS_Shape* pFOtherExt   = theFaceExtFaceMap.Seek(aFOther);
+      if (!pFCarrierExt || !pFOtherExt)
+      {
+        continue;
+      }
+
+      TopoDS_Edge anExtension;
+      if (!MakeExtensionEdge(anEnd,
+                             aFCarrier,
+                             TopoDS::Face(*pFCarrierExt),
+                             theFeatureBox,
+                             theMaxLength,
+                             anExtension))
+      {
+        continue;
+      }
+
+      // The extension lies on the carrier exactly; make sure it lies on the other face
+      // as well, within the tolerance
+      const double aDist = MaxDistanceToFace(anExtension, TopoDS::Face(*pFOtherExt));
+      if (aDist > THE_MAX_DEVIATION * theMaxLength)
+      {
+        continue;
+      }
+      if (aDist > BRep_Tool::Tolerance(anExtension))
+      {
+        BRep_Builder().UpdateEdge(anExtension, aDist + Precision::Confusion());
+      }
+
+      AddTrimEdge(anEnd.Pair, theFaceExtFaceMap, anExtension);
+      ++myTangentPairs(anEnd.Pair).NbExtended;
+      anEnd.IsDone = true;
+    }
+  }
+
+  //! Checks whether the pairs of faces are rebuilt on the same extended faces
+  bool IsSamePair(
+    const int thePair1,
+    const int thePair2,
+    const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
+      theFaceExtFaceMap) const
+  {
+    if (thePair1 == thePair2)
+    {
+      return true;
+    }
+    const TangentPair&  aPair1 = myTangentPairs(thePair1);
+    const TangentPair&  aPair2 = myTangentPairs(thePair2);
+    const TopoDS_Shape* pExt11 = theFaceExtFaceMap.Seek(aPair1.Face1);
+    const TopoDS_Shape* pExt12 = theFaceExtFaceMap.Seek(aPair1.Face2);
+    const TopoDS_Shape* pExt21 = theFaceExtFaceMap.Seek(aPair2.Face1);
+    const TopoDS_Shape* pExt22 = theFaceExtFaceMap.Seek(aPair2.Face2);
+    if (!pExt11 || !pExt12 || !pExt21 || !pExt22)
+    {
+      return false;
+    }
+    return (pExt11->IsSame(*pExt21) && pExt12->IsSame(*pExt22))
+           || (pExt11->IsSame(*pExt22) && pExt12->IsSame(*pExt21));
+  }
+
+  //! Registers the recovered boundary as a trimming tool of the extended faces of the
+  //! pair
+  void AddTrimEdge(
+    const int thePair,
+    const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
+                       theFaceExtFaceMap,
+    const TopoDS_Edge& theEdge)
+  {
+    const TangentPair& aPair = myTangentPairs(thePair);
+    for (int k = 0; k < 2; ++k)
+    {
+      const TopoDS_Shape* pFExt = theFaceExtFaceMap.Seek(k == 0 ? aPair.Face1 : aPair.Face2);
+      if (!pFExt)
+      {
+        continue;
+      }
+      NCollection_List<TopoDS_Shape>* pLE = myTrimEdges.ChangeSeek(*pFExt);
+      if (!pLE)
+      {
+        pLE = &myTrimEdges(myTrimEdges.Add(*pFExt, NCollection_List<TopoDS_Shape>()));
+      }
+      if (!pLE->Contains(theEdge))
+      {
+        pLE->Append(theEdge);
+      }
+    }
+  }
+
+  //! Builds the edge reconnecting the two ends along the curve of the edge of the
+  //! first one, provided the curve passes through the second end with the same
+  //! tangent as the edge of that end.
+  static bool MakeClosingEdge(const OpenEnd& theStart,
+                              const OpenEnd& theStop,
+                              TopoDS_Edge&   theClosing)
+  {
+    double                  aF1, aL1, aF2, aL2;
+    occ::handle<Geom_Curve> aC1 = BRep_Tool::Curve(theStart.Edge, aF1, aL1);
+    occ::handle<Geom_Curve> aC2 = BRep_Tool::Curve(theStop.Edge, aF2, aL2);
+    const double            aT1 = theStart.Param;
+    const double            aT2 = theStop.Param;
+    if (aC1.IsNull() || aC2.IsNull() || aT2 <= aT1 + Precision::PConfusion())
+    {
+      return false;
+    }
+    // The curve has to be defined up to the second end
+    if (!aC1->IsPeriodic()
+        && (aC1->FirstParameter() > aT1 + Precision::PConfusion()
+            || aC1->LastParameter() < aT2 - Precision::PConfusion()))
+    {
+      return false;
+    }
+    // And pass through it with the same tangent
+    const double aTol =
+      std::max(BRep_Tool::Tolerance(theStop.Vertex), BRep_Tool::Tolerance(theStart.Edge))
+      + BRep_Tool::Tolerance(theStop.Edge);
+    gp_Pnt aP1, aP2;
+    gp_Vec aD1, aD2;
+    aC1->D1(aT2, aP1, aD1);
+    aC2->D1(aT2, aP2, aD2);
+    if (aP1.Distance(BRep_Tool::Pnt(theStop.Vertex)) > aTol || aP1.Distance(aP2) > aTol)
+    {
+      return false;
+    }
+    if (aD1.SquareMagnitude() < gp::Resolution() || aD2.SquareMagnitude() < gp::Resolution()
+        || aD1.Angle(aD2) > THE_TANGENT_ANGLE)
+    {
+      return false;
+    }
+
+    BRepBuilderAPI_MakeEdge aME(aC1, theStart.Vertex, theStop.Vertex, aT1, aT2);
+    if (!aME.IsDone())
+    {
+      return false;
+    }
+    theClosing = aME.Edge();
+    return true;
+  }
+
+  //! Builds the edge extending the open end into the gap along the straight
+  //! continuation of the pcurve of its edge on the carrier face, so that it lies on
+  //! the extended surface of the carrier exactly. The extension stops when it leaves
+  //! the box of the feature, at the bounds of the surface, or at the given length.
+  static bool MakeExtensionEdge(const OpenEnd&     theEnd,
+                                const TopoDS_Face& theCarrier,
+                                const TopoDS_Face& theCarrierExt,
+                                const Bnd_Box&     theFeatureBox,
+                                const double       theLength,
+                                TopoDS_Edge&       theExtension)
+  {
+    double                    aF2d, aL2d;
+    occ::handle<Geom2d_Curve> aC2d = BRep_Tool::CurveOnSurface(theEnd.Edge, theCarrier, aF2d, aL2d);
+    occ::handle<Geom_Surface> aS   = BRep_Tool::Surface(theCarrierExt);
+    if (aC2d.IsNull() || aS.IsNull())
+    {
+      return false;
+    }
+
+    // Take the end of the pcurve, as it may be parametrized differently from the curve
+    gp_Pnt2d aP2d;
+    gp_Vec2d aD2d;
+    aC2d->D1(theEnd.IsForward ? aL2d : aF2d, aP2d, aD2d);
+    if (aD2d.SquareMagnitude() < gp::Resolution())
+    {
+      return false;
+    }
+    if (!theEnd.IsForward)
+    {
+      aD2d.Reverse();
+    }
+    aD2d.Normalize();
+
+    // Make sure the surface of the extended face is parametrized as the carrier
+    if (aS->Value(aP2d.X(), aP2d.Y()).Distance(BRep_Tool::Pnt(theEnd.Vertex))
+        > std::max(BRep_Tool::Tolerance(theEnd.Vertex), BRep_Tool::Tolerance(theEnd.Edge)))
+    {
+      return false;
+    }
+
+    // Parametric length of the extension: the given 3D length measured by the
+    // derivative of the surface in the direction of the extension
+    gp_Pnt aP;
+    gp_Vec aDU, aDV;
+    aS->D1(aP2d.X(), aP2d.Y(), aP, aDU, aDV);
+    const double aScale = (aDU * aD2d.X() + aDV * aD2d.Y()).Magnitude();
+    if (aScale < gp::Resolution())
+    {
+      return false;
+    }
+    double aLen2d = theLength / aScale;
+
+    // Keep the extension within the bounds of the surface
+    double aU1, aU2, aV1, aV2;
+    aS->Bounds(aU1, aU2, aV1, aV2);
+    if (aD2d.X() > gp::Resolution() && !Precision::IsInfinite(aU2))
+    {
+      aLen2d = std::min(aLen2d, (aU2 - aP2d.X()) / aD2d.X());
+    }
+    else if (aD2d.X() < -gp::Resolution() && !Precision::IsInfinite(aU1))
+    {
+      aLen2d = std::min(aLen2d, (aU1 - aP2d.X()) / aD2d.X());
+    }
+    if (aD2d.Y() > gp::Resolution() && !Precision::IsInfinite(aV2))
+    {
+      aLen2d = std::min(aLen2d, (aV2 - aP2d.Y()) / aD2d.Y());
+    }
+    else if (aD2d.Y() < -gp::Resolution() && !Precision::IsInfinite(aV1))
+    {
+      aLen2d = std::min(aLen2d, (aV1 - aP2d.Y()) / aD2d.Y());
+    }
+    if (aLen2d < Precision::PConfusion())
+    {
+      return false;
+    }
+
+    occ::handle<Geom2d_Line> aLine2d = new Geom2d_Line(aP2d, gp_Dir2d(aD2d));
+
+    // Stop the extension once it has left the (slightly enlarged) box of the feature
+    Bnd_Box aBox = theFeatureBox;
+    aBox.Enlarge(THE_FEATURE_BOX_MARGIN * sqrt(theFeatureBox.SquareExtent()));
+    for (int i = 1; i <= THE_NB_EXTENSION_STEPS; ++i)
+    {
+      const double   aT = aLen2d * i / THE_NB_EXTENSION_STEPS;
+      const gp_Pnt2d aQ = aLine2d->Value(aT);
+      if (aBox.IsOut(aS->Value(aQ.X(), aQ.Y())))
+      {
+        aLen2d = aT;
+        break;
+      }
+    }
+
+    const gp_Pnt2d          aQEnd = aLine2d->Value(aLen2d);
+    const TopoDS_Vertex     aVEnd = BRepBuilderAPI_MakeVertex(aS->Value(aQEnd.X(), aQEnd.Y()));
+    BRepBuilderAPI_MakeEdge aME(aLine2d, aS, theEnd.Vertex, aVEnd, 0.0, aLen2d);
+    if (!aME.IsDone())
+    {
+      return false;
+    }
+    theExtension = aME.Edge();
+    BRepLib::BuildCurves3d(theExtension);
+    return true;
+  }
+
+  //! Returns the angle by which the pcurve of the edge of the end turns on the face
+  //! over the last twentieth of its parametric range before the end (zero for the
+  //! iso-lines of the face).
+  static double PCurveTurn(const OpenEnd& theEnd, const TopoDS_Face& theF)
+  {
+    double                    aF, aL;
+    occ::handle<Geom2d_Curve> aC2d = BRep_Tool::CurveOnSurface(theEnd.Edge, theF, aF, aL);
+    if (aC2d.IsNull())
+    {
+      return M_PI;
+    }
+    const double aTEnd = theEnd.IsForward ? aL : aF;
+    const double aTIn  = theEnd.IsForward ? aL - 0.05 * (aL - aF) : aF + 0.05 * (aL - aF);
+    gp_Pnt2d     aP;
+    gp_Vec2d     aDEnd, aDIn;
+    aC2d->D1(aTEnd, aP, aDEnd);
+    aC2d->D1(aTIn, aP, aDIn);
+    if (aDEnd.SquareMagnitude() < gp::Resolution() || aDIn.SquareMagnitude() < gp::Resolution())
+    {
+      return M_PI;
+    }
+    return std::abs(aDEnd.Angle(aDIn));
+  }
+
+  //! Computes the greatest distance of the points of the edge to the surface of the
+  //! face within its parametric domain
+  static double MaxDistanceToFace(const TopoDS_Edge& theE, const TopoDS_Face& theF)
+  {
+    occ::handle<Geom_Surface> aS = BRep_Tool::Surface(theF);
+    double                    aF, aL;
+    occ::handle<Geom_Curve>   aC = BRep_Tool::Curve(theE, aF, aL);
+    if (aS.IsNull() || aC.IsNull())
+    {
+      return RealLast();
+    }
+    double aU1, aU2, aV1, aV2;
+    BRepTools::UVBounds(theF, aU1, aU2, aV1, aV2);
+    double aDist = 0.0;
+    for (int i = 0; i <= THE_NB_DISTANCE_SAMPLES; ++i)
+    {
+      const gp_Pnt               aP = aC->Value(aF + (aL - aF) * i / THE_NB_DISTANCE_SAMPLES);
+      GeomAPI_ProjectPointOnSurf aProj(aP, aS, aU1, aU2, aV1, aV2, Precision::Confusion());
+      if (!aProj.IsDone() || aProj.NbPoints() == 0)
+      {
+        return RealLast();
+      }
+      aDist = std::max(aDist, aProj.LowerDistance());
+    }
+    return aDist;
+  }
+
+  //! Returns true if the boundary of some pair of tangent faces has been recovered by
+  //! the extension of a single end, which is a guess at the boundary
+  bool HasExtendedTangentBoundaries() const
+  {
+    for (int i = 0; i < myTangentPairs.Length(); ++i)
+    {
+      if (myTangentPairs(i).NbExtended > 0)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
   //! Trims the extended adjacent faces by intersection with each other
   //! and following intersection with the bounds of original faces.
+  //! The tangent faces whose common boundaries have been recovered from the edges
+  //! are not intersected with each other, unless the boundary has been guessed by
+  //! the extension of a single end and theIntersectExtended is set.
   void TrimExtendedFaces(
     const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
                                  theFaceExtFaceMap,
+    const bool                   theIntersectExtended,
     const Message_ProgressRange& theRange)
   {
     // Intersect the extended faces first
     BOPAlgo_Builder aGFInter;
-    // Add faces for intersection (the faces of a group of coincident faces share one)
+    // The unique extended faces (the faces of a group of coincident faces share one)
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> anExtFaces;
     for (int i = 1; i <= theFaceExtFaceMap.Extent(); ++i)
     {
-      if (anExtFaces.Add(theFaceExtFaceMap(i)))
+      anExtFaces.Add(theFaceExtFaceMap(i));
+    }
+    const int aNbF = anExtFaces.Extent();
+
+    // Add faces for intersection. The faces tangent to each other whose common
+    // boundaries have been recovered are not intersected, so the faces connected by
+    // such pairs are collected into one compound: the sub-shapes of an argument are
+    // not intersected with each other. The other tangent pairs are intersected as
+    // any other faces.
+    NCollection_Array1<int> aBlocks(1, aNbF);
+    for (int i = 1; i <= aNbF; ++i)
+    {
+      aBlocks(i) = i;
+    }
+    auto aRoot = [&aBlocks](int i) {
+      while (aBlocks(i) != i)
       {
-        aGFInter.AddArgument(theFaceExtFaceMap(i));
+        i = aBlocks(i);
       }
+      return i;
+    };
+    for (int i = 0; i < myTangentPairs.Length(); ++i)
+    {
+      const TangentPair& aPair       = myTangentPairs(i);
+      const bool         isRecovered = (aPair.NbClosed + aPair.NbExtended == aPair.NbOpenEnds);
+      if (!isRecovered || (theIntersectExtended && aPair.NbExtended > 0))
+      {
+        continue;
+      }
+      const TopoDS_Shape* pExt1 = theFaceExtFaceMap.Seek(aPair.Face1);
+      const TopoDS_Shape* pExt2 = theFaceExtFaceMap.Seek(aPair.Face2);
+      if (pExt1 && pExt2)
+      {
+        aBlocks(aRoot(anExtFaces.FindIndex(*pExt1))) = aRoot(anExtFaces.FindIndex(*pExt2));
+      }
+    }
+    NCollection_Array1<int> aBlockSizes(1, aNbF);
+    aBlockSizes.Init(0);
+    for (int i = 1; i <= aNbF; ++i)
+    {
+      ++aBlockSizes(aRoot(i));
+    }
+    NCollection_DataMap<int, TopoDS_Shape> aBlockCompounds;
+    for (int i = 1; i <= aNbF; ++i)
+    {
+      const int aBlock = aRoot(i);
+      if (aBlockSizes(aBlock) == 1)
+      {
+        aGFInter.AddArgument(anExtFaces(i));
+        continue;
+      }
+      TopoDS_Shape* pC = aBlockCompounds.ChangeSeek(aBlock);
+      if (!pC)
+      {
+        TopoDS_Compound aC;
+        BRep_Builder().MakeCompound(aC);
+        pC = aBlockCompounds.Bound(aBlock, aC);
+        aGFInter.AddArgument(aC);
+      }
+      BRep_Builder().Add(*pC, anExtFaces(i));
     }
     aGFInter.SetRunParallel(myRunParallel);
     aGFInter.SetFuzzyValue(myFuzzyValue);
@@ -1259,6 +1837,16 @@ private: //! @name Private methods performing the operation
     NCollection_List<TopoDS_Shape> anExtSplits;
     TakeModified(theFExt, theGFInter, anExtSplits);
     aGFTrim.SetArguments(anExtSplits);
+
+    // Add the recovered boundaries with the tangent faces
+    if (const NCollection_List<TopoDS_Shape>* pLE = myTrimEdges.Seek(theFExt))
+    {
+      NCollection_List<TopoDS_Shape>::Iterator itLE(*pLE);
+      for (; itLE.More(); itLE.Next())
+      {
+        aGFTrim.AddArgument(itLE.Value());
+      }
+    }
 
     // Add edges of the original faces
     NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMEdgesToCheckOri;
@@ -1518,6 +2106,9 @@ private: //! @name Fields
   // Results
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureFacesMap;              //!< Faces of the feature
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureEdgesMap;       //!< Edges of the feature
+  NCollection_DynamicArray<TangentPair> myTangentPairs;  //!< Pairs of adjacent faces tangent to each other
+  NCollection_DynamicArray<OpenEnd> myOpenEnds;          //!< Ends of the edges between tangent faces cut off by the feature
+  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myTrimEdges; //!< Recovered boundaries between tangent faces, by extended face
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myGroups; //!< Groups of adjacent faces lying on the same surface, by their first face
   bool myHasAdjacentFaces;                //!< Flag to show whether the adjacent faces have been found or not
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
@@ -1542,6 +2133,24 @@ private: //! @name Fields
   //! Least component of the direction of the gap (relative to its length) for the face
   //! to be extended in that parametric direction
   static constexpr double THE_DIRECTION_THRESHOLD = 0.1;
+
+  //! Faces meeting at a smaller angle are considered tangent to each other
+  static constexpr double THE_TANGENT_ANGLE = 5. * M_PI / 180.;
+
+  //! Greatest deviation of the recovered boundary from the tangent face it is not
+  //! built on, relative to the length of the extension
+  static constexpr double THE_MAX_DEVIATION = 1.e-3;
+
+  //! Relative margin added to the box of the feature to stop the extension of the
+  //! recovered boundaries
+  static constexpr double THE_FEATURE_BOX_MARGIN = 0.1;
+
+  //! Number of steps in which the extension of a recovered boundary is checked
+  //! against the box of the feature
+  static constexpr int THE_NB_EXTENSION_STEPS = 20;
+
+  //! Number of points of a recovered boundary checked against the tangent face
+  static constexpr int THE_NB_DISTANCE_SAMPLES = 10;
 };
 
 typedef NCollection_DynamicArray<FillGap> VectorOfFillGap;

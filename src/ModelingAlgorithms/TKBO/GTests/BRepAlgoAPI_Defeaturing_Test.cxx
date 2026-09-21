@@ -45,11 +45,13 @@ const double THE_POCKET_TILT     = 7.0; // degrees
 const double THE_TOOL_HEIGHT     = 5.0;
 const double THE_BLEND_RADIUS    = 0.5;
 
-const double THE_BOX_LENGTH   = 60.0;
-const double THE_BOX_WIDTH    = 40.0;
-const double THE_BOX_HEIGHT   = 20.0;
-const double THE_GROOVE_WIDTH = 10.0;
-const double THE_GROOVE_DEPTH = 10.0;
+const double THE_BOX_LENGTH      = 60.0;
+const double THE_BOX_WIDTH       = 40.0;
+const double THE_BOX_HEIGHT      = 20.0;
+const double THE_GROOVE_WIDTH    = 10.0;
+const double THE_GROOVE_DEPTH    = 10.0;
+const double THE_HOLE_RADIUS     = 3.0;
+const double THE_BIG_HOLE_RADIUS = 4.0;
 
 int CountFaces(const TopoDS_Shape& theShape)
 {
@@ -347,6 +349,68 @@ CutModel MakeGroovedBox()
       .Shape();
   return MakeCut(aBox, aGroove);
 }
+
+//! A box with a round on its top front edge, drilled along the given axis.
+//!
+//! The round runs along X on the edge y = 0, z = THE_BOX_HEIGHT; its lines of
+//! tangency with the top and the front faces are the lines y = THE_ROUND_RADIUS
+//! on the top and z = THE_BOX_HEIGHT - THE_ROUND_RADIUS on the front. A hole
+//! crossing such a line cuts the edge shared by the round and its support face
+//! in two, and the two faces are tangent along it: the intersection of their
+//! extensions cannot provide the boundary between them inside the hole.
+//! @param theNurbs when true the rounded box is converted to B-spline surfaces before
+//!                drilling, so that the tangency of the round to its support faces
+//!                is not seen by the intersection of elementary surfaces
+CutModel MakeDrilledRound(const gp_Ax2& theHoleAxis,
+                          const double  theHoleRadius,
+                          const bool    theNurbs = false)
+{
+  const TopoDS_Shape aBox =
+    BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 0.0),
+                        gp_Pnt(THE_BOX_LENGTH, THE_BOX_WIDTH, THE_BOX_HEIGHT))
+      .Shape();
+
+  // The edge to round: y = 0, z = THE_BOX_HEIGHT.
+  TopoDS_Edge anEdge;
+  ShapeMap    anEdges;
+  TopExp::MapShapes(aBox, TopAbs_EDGE, anEdges);
+  for (int anIndex = 1; anIndex <= anEdges.Extent() && anEdge.IsNull(); ++anIndex)
+  {
+    const TopoDS_Edge& aCandidate = TopoDS::Edge(anEdges(anIndex));
+    TopoDS_Vertex      aV1, aV2;
+    TopExp::Vertices(aCandidate, aV1, aV2);
+    const gp_Pnt aP1 = BRep_Tool::Pnt(aV1);
+    const gp_Pnt aP2 = BRep_Tool::Pnt(aV2);
+    if (aP1.Y() < Precision::Confusion() && aP2.Y() < Precision::Confusion()
+        && std::abs(aP1.Z() - THE_BOX_HEIGHT) < Precision::Confusion()
+        && std::abs(aP2.Z() - THE_BOX_HEIGHT) < Precision::Confusion())
+    {
+      anEdge = aCandidate;
+    }
+  }
+  if (anEdge.IsNull())
+  {
+    return CutModel();
+  }
+
+  BRepFilletAPI_MakeFillet aFilletMaker(aBox);
+  aFilletMaker.Add(THE_ROUND_RADIUS, anEdge);
+  aFilletMaker.Build();
+  if (!aFilletMaker.IsDone())
+  {
+    return CutModel();
+  }
+
+  TopoDS_Shape aRounded = aFilletMaker.Shape();
+  if (theNurbs)
+  {
+    aRounded = BRepBuilderAPI_NurbsConvert(aRounded).Shape();
+  }
+
+  const TopoDS_Shape aDrill =
+    BRepPrimAPI_MakeCylinder(theHoleAxis, theHoleRadius, 2.0 * THE_BOX_LENGTH).Shape();
+  return MakeCut(aRounded, aDrill);
+}
 } // namespace
 
 // The extension of the adjacent faces used to be sized by the bounding box of
@@ -409,4 +473,54 @@ TEST(BRepAlgoAPI_DefeaturingTest, EnclosedWallPocket_WallFullyOnBlends_BlendsRem
 TEST(BRepAlgoAPI_DefeaturingTest, GrooveAcrossBox_TopFaceSplitInTwo_GrooveRemoved)
 {
   CheckCutRemoved(MakeGroovedBox());
+}
+
+// A vertical hole crossing the line of tangency between the round and the
+// top face. The top face and the round are tangent along that line, so the
+// intersection of their extensions does not give the boundary between them
+// inside the hole; it is recovered by reconnecting the two pieces of the edge
+// along its curve.
+TEST(BRepAlgoAPI_DefeaturingTest, DrilledRound_HoleAcrossTangencyLine_HoleRemoved)
+{
+  const gp_Ax2 anAxis(gp_Pnt(THE_BOX_LENGTH / 2.0, THE_ROUND_RADIUS, THE_BOX_HEIGHT + 10.0),
+                      gp_Dir(0.0, 0.0, -1.0));
+  CheckCutRemoved(MakeDrilledRound(anAxis, THE_HOLE_RADIUS));
+}
+
+// A hole drilled through the round along the bisector of its support faces,
+// wide enough to cut the round in two faces of one cylinder. Both pieces are
+// tangent to the top and the front faces; they are rebuilt as one face, and
+// the boundaries with the top and the front faces are reconnected across it.
+TEST(BRepAlgoAPI_DefeaturingTest, DrilledRound_HoleSplittingTheRound_HoleRemoved)
+{
+  // The axis passes through the middle of the round, at 45 degrees to its support faces.
+  const double aSin45 = sin(M_PI / 4.0);
+  const gp_Pnt aMiddle(THE_BOX_LENGTH / 2.0,
+                       THE_ROUND_RADIUS * (1.0 - aSin45),
+                       THE_BOX_HEIGHT - THE_ROUND_RADIUS * (1.0 - aSin45));
+  const gp_Dir aDir(0.0, aSin45, -aSin45);
+  const gp_Ax2 anAxis(aMiddle.Translated(gp_Vec(aDir) * -10.0), aDir);
+  CheckCutRemoved(MakeDrilledRound(anAxis, THE_BIG_HOLE_RADIUS));
+}
+
+// The same holes in the box converted to B-spline surfaces. The tangency of
+// the round to its support faces is then not seen by the intersection of the
+// extended faces, and the boundaries between them inside the hole can only
+// be recovered from the edges cut by the hole.
+TEST(BRepAlgoAPI_DefeaturingTest, DrilledRound_HoleAcrossTangencyLineOfBSplines_HoleRemoved)
+{
+  const gp_Ax2 anAxis(gp_Pnt(THE_BOX_LENGTH / 2.0, THE_ROUND_RADIUS, THE_BOX_HEIGHT + 10.0),
+                      gp_Dir(0.0, 0.0, -1.0));
+  CheckCutRemoved(MakeDrilledRound(anAxis, THE_HOLE_RADIUS, true));
+}
+
+TEST(BRepAlgoAPI_DefeaturingTest, DrilledRound_HoleSplittingTheBSplineRound_HoleRemoved)
+{
+  const double aSin45 = sin(M_PI / 4.0);
+  const gp_Pnt aMiddle(THE_BOX_LENGTH / 2.0,
+                       THE_ROUND_RADIUS * (1.0 - aSin45),
+                       THE_BOX_HEIGHT - THE_ROUND_RADIUS * (1.0 - aSin45));
+  const gp_Dir aDir(0.0, aSin45, -aSin45);
+  const gp_Ax2 anAxis(aMiddle.Translated(gp_Vec(aDir) * -10.0), aDir);
+  CheckCutRemoved(MakeDrilledRound(anAxis, THE_BIG_HOLE_RADIUS, true));
 }
