@@ -383,7 +383,9 @@ public: //! @name Constructors
   FillGap()
       : myRunParallel(false),
         myHasAdjacentFaces(false),
-        myTrimDegenerated(false)
+        myTrimDegenerated(false),
+        myTrimFailed(false),
+        myNbDegenerated(0)
   {
   }
 
@@ -453,7 +455,7 @@ public: //! @name Perform the operation
       // small for the extended adjacent faces to reach each other. In that case trimming
       // of the extended faces degenerates and the untrimmed extensions leak into the
       // result, making the reconstruction unusable. Retry with a longer extension,
-      // keeping the result of the first attempt if none of them succeeds.
+      // keeping the best reconstruction if none of the attempts succeeds completely.
       Bnd_Box aFeatureBox;
       BRepBndLib::Add(myFeature, aFeatureBox);
       const double aFeatureSize = sqrt(aFeatureBox.SquareExtent());
@@ -476,17 +478,23 @@ public: //! @name Perform the operation
                      1 + static_cast<int>(std::ceil(std::log2(aSolidsSize / aFeatureSize))))
              : THE_NB_EXTENSION_ATTEMPTS;
 
+      // The best reconstruction so far: the one with the most adjacent faces trimmed by
+      // the bounds of their original faces. On a tie the shorter extension wins, as it
+      // is the closest to the original geometry.
       NCollection_IndexedDataMap<TopoDS_Shape,
                                  NCollection_List<TopoDS_Shape>,
                                  TopTools_ShapeMapHasher>
-                                                             aFacesFirst;
-      occ::handle<BRepTools_History>                         aHistoryFirst;
-      NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAnchoredFirst;
+                                                             aFacesBest;
+      occ::handle<BRepTools_History>                         aHistoryBest = myHistory;
+      NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAnchoredBest;
+      int                                                    aBestQuality = -1;
 
       Message_ProgressScope aPSExt(aPS.Next(2), nullptr, aNbAttempts);
       for (int anAttempt = 0; anAttempt < aNbAttempts; ++anAttempt)
       {
         myTrimDegenerated = false;
+        myTrimFailed      = false;
+        myNbDegenerated   = 0;
         myFaces.Clear();
         myAnchoredFaces.Clear();
         myHistory = new BRepTools_History();
@@ -508,27 +516,38 @@ public: //! @name Perform the operation
         // Trim the extended faces
         TrimExtendedFaces(aFaceExtFaceMap, aPSAttempt.Next());
 
-        if (!myTrimDegenerated)
+        // The reconstruction is complete when every adjacent face has been trimmed by
+        // the bounds of its original face. Otherwise it is rated by the number of the
+        // faces trimmed that way: the faces that could not be trimmed at all are left
+        // out of the reconstruction, the faces whose trim degenerated are kept
+        // untrimmed, and either kind makes the rebuilt solids invalid.
+        const bool isComplete =
+          !myTrimFailed && !myTrimDegenerated && myFaces.Extent() == aMFAdjacent.Extent();
+        const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
+        if (isComplete || aQuality > aBestQuality)
+        {
+          aBestQuality   = aQuality;
+          aFacesBest     = myFaces;
+          anAnchoredBest = myAnchoredFaces;
+          aHistoryBest   = myHistory;
+        }
+
+        if (isComplete)
         {
           break;
         }
-
-        if (anAttempt == 0)
+        if (myTrimFailed)
         {
-          aFacesFirst     = myFaces;
-          anAnchoredFirst = myAnchoredFaces;
-          aHistoryFirst   = myHistory;
+          // The extended faces could not even be intersected -
+          // a longer extension is not going to make it any better.
+          break;
         }
       }
 
-      if (myTrimDegenerated)
-      {
-        // None of the attempts produced a properly trimmed reconstruction -
-        // keep the result of the first one.
-        myFaces         = aFacesFirst;
-        myAnchoredFaces = anAnchoredFirst;
-        myHistory       = aHistoryFirst;
-      }
+      // Keep the best reconstruction
+      myFaces         = aFacesBest;
+      myAnchoredFaces = anAnchoredBest;
+      myHistory       = aHistoryBest;
     }
     catch (Standard_Failure const&)
     {
@@ -706,6 +725,7 @@ private: //! @name Private methods performing the operation
       aGFInter.Perform(aPSOuter.Next());
       if (aGFInter.HasErrors())
       {
+        myTrimFailed = true;
         return;
       }
 
@@ -965,6 +985,7 @@ private: //! @name Private methods performing the operation
       // each other. Signal it, so that the extension can be retried with a greater
       // length.
       myTrimDegenerated = true;
+      ++myNbDegenerated;
       // Use all splits, including those having the bounds of extended face
       anExpF.ReInit();
       for (; anExpF.More(); anExpF.Next())
@@ -982,7 +1003,9 @@ private: //! @name Private methods performing the operation
 
       // Remember the splits whose orientation is confirmed by an edge of the original face;
       // they are the trusted evidence for classifying the cells built by MakerVolume.
-      const bool bAllAnchored = bSingleSplit && !aMEdgesToCheckOri.IsEmpty() && !myTrimDegenerated;
+      // A single split is confirmed by all such edges at once (the degenerated trim is
+      // excluded, as it has not been trimmed by any of them).
+      const bool bAllAnchored = bSingleSplit && !aMEdgesToCheckOri.IsEmpty();
       NCollection_List<TopoDS_Shape>::Iterator itLFA(aLFTrimmed);
       for (; itLFA.More(); itLFA.Next())
       {
@@ -1031,7 +1054,9 @@ private: //! @name Fields
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myFaces;  //!< Reconstructed adjacent faces
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myAnchoredFaces; //!< Reconstructed faces validated by an edge of the original face
   occ::handle<BRepTools_History> myHistory;                //!< History of the adjacent faces reconstruction
-  bool myTrimDegenerated;                 //!< Flag to show that trimming of the extended faces has failed
+  bool myTrimDegenerated;                 //!< Flag to show that trimming of some extended face degenerated
+  bool myTrimFailed;                      //!< Flag to show that the extended faces could not be intersected
+  int myNbDegenerated;                    //!< Number of the extended faces whose trimming degenerated
   // clang-format on
 
   //! Least number of attempts to extend the adjacent faces, each one doubling the
