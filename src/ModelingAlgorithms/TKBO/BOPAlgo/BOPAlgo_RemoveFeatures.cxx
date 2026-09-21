@@ -23,16 +23,30 @@
 #include <Standard_ErrorHandler.hxx>
 
 #include <BOPTools_AlgoTools.hxx>
+#include <BOPTools_AlgoTools2D.hxx>
 #include <BOPTools_Parallel.hxx>
 #include <BOPTools_Set.hxx>
 
 #include <Bnd_Box.hxx>
 
 #include <BRep_Builder.hxx>
+#include <BRep_Tool.hxx>
+
+#include <BRepAdaptor_Curve.hxx>
 
 #include <BRepBndLib.hxx>
 
 #include <BRepLib.hxx>
+#include <BRepLib_MakeFace.hxx>
+#include <BRepTools.hxx>
+
+#include <ElCLib.hxx>
+
+#include <Geom_RectangularTrimmedSurface.hxx>
+#include <Geom_Surface.hxx>
+#include <Geom2d_Curve.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <GeomConvert_SurfToAnaSurf.hxx>
 
 #include <NCollection_DynamicArray.hxx>
 
@@ -47,6 +61,8 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <TopLoc_Location.hxx>
 
 #include <TopoDS_Shape.hxx>
 #include <TopTools_ShapeMapHasher.hxx>
@@ -690,17 +706,265 @@ private: //! @name Private methods performing the operation
                                  theFaceExtFaceMap,
     const Message_ProgressRange& theRange)
   {
-    const int             aNbFA = theMFAdjacent.Extent();
-    Message_ProgressScope aPS(theRange, "Extending adjacent faces", aNbFA);
-    for (int i = 1; i <= aNbFA && aPS.More(); ++i, aPS.Next())
+    // The adjacent faces lying on the same surface (e.g. the two parts of a fillet cut
+    // by the feature) are rebuilt as a single face: rebuilt separately, each of them
+    // would cover the gap and their reconstructions would overlap each other.
+    if (myGroups.IsEmpty())
     {
-      const TopoDS_Face& aF = TopoDS::Face(theMFAdjacent(i));
+      GroupCoincidentFaces(theMFAdjacent);
+    }
+
+    const int             aNbG = myGroups.Extent();
+    Message_ProgressScope aPS(theRange, "Extending adjacent faces", aNbG);
+    for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
+    {
+      const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
+      const TopoDS_Face                     aF       = MakeGroupFace(aMembers);
       // Extend the face
       TopoDS_Face aFExt;
       BRepLib::ExtendFace(aF, theExtLength, true, true, true, true, aFExt);
-      theFaceExtFaceMap.Add(aF, aFExt);
-      myHistory->AddModified(aF, aFExt);
+
+      NCollection_List<TopoDS_Shape>::Iterator itM(aMembers);
+      for (; itM.More(); itM.Next())
+      {
+        theFaceExtFaceMap.Add(itM.Value(), aFExt);
+        myHistory->AddModified(itM.Value(), aFExt);
+      }
     }
+  }
+
+  //! Groups the adjacent faces lying on the same surface. The first face of each
+  //! group is its representative: the group is rebuilt in the parametric space of
+  //! its surface.
+  void GroupCoincidentFaces(
+    const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theMFAdjacent)
+  {
+    myGroups.Clear();
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aGrouped;
+    const int                                              aNbFA = theMFAdjacent.Extent();
+    for (int i = 1; i <= aNbFA; ++i)
+    {
+      const TopoDS_Face& aF = TopoDS::Face(theMFAdjacent(i));
+      if (!aGrouped.Add(aF))
+      {
+        continue;
+      }
+      NCollection_List<TopoDS_Shape>& aMembers =
+        myGroups(myGroups.Add(aF, NCollection_List<TopoDS_Shape>()));
+      aMembers.Append(aF);
+      for (int j = i + 1; j <= aNbFA; ++j)
+      {
+        const TopoDS_Face& aFOther = TopoDS::Face(theMFAdjacent(j));
+        if (!aGrouped.Contains(aFOther) && AreCoincident(aF, aFOther))
+        {
+          aGrouped.Add(aFOther);
+          aMembers.Append(aFOther);
+        }
+      }
+    }
+  }
+
+  //! Checks whether the faces lie on the same surface and look the same way: they
+  //! share the surface, or their elementary surfaces coincide within the tolerance.
+  static bool AreCoincident(const TopoDS_Face& theF1, const TopoDS_Face& theF2)
+  {
+    TopLoc_Location                  aLoc1, aLoc2;
+    const occ::handle<Geom_Surface>& aS1 = BRep_Tool::Surface(theF1, aLoc1);
+    const occ::handle<Geom_Surface>& aS2 = BRep_Tool::Surface(theF2, aLoc2);
+    if (aS1.IsNull() || aS2.IsNull())
+    {
+      return false;
+    }
+    if (aS1 == aS2 && aLoc1.IsEqual(aLoc2))
+    {
+      return theF1.Orientation() == theF2.Orientation();
+    }
+
+    // Located copies of the surfaces with the trimming removed
+    occ::handle<Geom_Surface> aS1L = BRep_Tool::Surface(theF1);
+    occ::handle<Geom_Surface> aS2L = BRep_Tool::Surface(theF2);
+    if (occ::handle<Geom_RectangularTrimmedSurface> aTS =
+          occ::down_cast<Geom_RectangularTrimmedSurface>(aS1L))
+    {
+      aS1L = aTS->BasisSurface();
+    }
+    if (occ::handle<Geom_RectangularTrimmedSurface> aTS =
+          occ::down_cast<Geom_RectangularTrimmedSurface>(aS2L))
+    {
+      aS2L = aTS->BasisSurface();
+    }
+    const double aTol = std::max(BRep_Tool::Tolerance(theF1), BRep_Tool::Tolerance(theF2));
+    if (!GeomConvert_SurfToAnaSurf::IsSame(aS1L, aS2L, aTol))
+    {
+      return false;
+    }
+
+    // Compare the normals to the faces in a point of the second one
+    TopExp_Explorer anExpE(theF2, TopAbs_EDGE);
+    for (; anExpE.More(); anExpE.Next())
+    {
+      gp_Pnt aP;
+      gp_Dir aDN2;
+      if (!NormalToFaceOnEdge(TopoDS::Edge(anExpE.Current()), theF2, aP, aDN2))
+      {
+        continue;
+      }
+      GeomAPI_ProjectPointOnSurf aProj(aP, aS1L);
+      if (!aProj.IsDone() || aProj.NbPoints() == 0)
+      {
+        return false;
+      }
+      double aU, aV;
+      aProj.LowerDistanceParameters(aU, aV);
+      gp_Vec aDU, aDV;
+      aS1L->D1(aU, aV, aP, aDU, aDV);
+      gp_Vec aDN1 = aDU.Crossed(aDV);
+      if (aDN1.SquareMagnitude() < gp::Resolution())
+      {
+        continue;
+      }
+      if (theF1.Orientation() == TopAbs_REVERSED)
+      {
+        aDN1.Reverse();
+      }
+      return aDN1.Dot(aDN2) > 0.0;
+    }
+    return false;
+  }
+
+  //! Computes the normal to the face in the middle of the edge, taking the orientation
+  //! of the face into account. Returns false if the normal is not defined there.
+  static bool NormalToFaceOnEdge(const TopoDS_Edge& theE,
+                                 const TopoDS_Face& theF,
+                                 gp_Pnt&            theP,
+                                 gp_Dir&            theDN)
+  {
+    if (BRep_Tool::Degenerated(theE))
+    {
+      return false;
+    }
+    double                    aT1, aT2;
+    occ::handle<Geom2d_Curve> aC2d = BRep_Tool::CurveOnSurface(theE, theF, aT1, aT2);
+    occ::handle<Geom_Surface> aS   = BRep_Tool::Surface(theF);
+    if (aC2d.IsNull() || aS.IsNull())
+    {
+      return false;
+    }
+    const gp_Pnt2d aP2d = aC2d->Value(BOPTools_AlgoTools2D::IntermediatePoint(aT1, aT2));
+    gp_Vec         aDU, aDV;
+    aS->D1(aP2d.X(), aP2d.Y(), theP, aDU, aDV);
+    const gp_Vec aDN = aDU.Crossed(aDV);
+    if (aDN.SquareMagnitude() < gp::Resolution())
+    {
+      return false;
+    }
+    theDN = aDN;
+    if (theF.Orientation() == TopAbs_REVERSED)
+    {
+      theDN.Reverse();
+    }
+    return true;
+  }
+
+  //! Builds the face covering all the faces of the group on the surface of its
+  //! representative (the first face). A group of a single face is the face itself.
+  static TopoDS_Face MakeGroupFace(const NCollection_List<TopoDS_Shape>& theMembers)
+  {
+    const TopoDS_Face& aFRep = TopoDS::Face(theMembers.First());
+    if (theMembers.Extent() == 1)
+    {
+      return aFRep;
+    }
+
+    occ::handle<Geom_Surface> aS = BRep_Tool::Surface(aFRep);
+    double                    aUMin, aUMax, aVMin, aVMax;
+    BRepTools::UVBounds(aFRep, aUMin, aUMax, aVMin, aVMax);
+    const double aUPeriod = aS->IsUPeriodic() ? aS->UPeriod() : 0.0;
+    const double aVPeriod = aS->IsVPeriodic() ? aS->VPeriod() : 0.0;
+    double       aTol     = BRep_Tool::Tolerance(aFRep);
+
+    // Enlarge the parametric domain of the representative to cover the other
+    // members: the projections of their vertices and of the middles of their edges
+    NCollection_List<TopoDS_Shape>::Iterator itM(theMembers);
+    for (itM.Next(); itM.More(); itM.Next())
+    {
+      const TopoDS_Face& aFM = TopoDS::Face(itM.Value());
+      aTol                   = std::max(aTol, BRep_Tool::Tolerance(aFM));
+
+      NCollection_List<gp_Pnt> aPoints;
+      TopExp_Explorer          anExpV(aFM, TopAbs_VERTEX);
+      for (; anExpV.More(); anExpV.Next())
+      {
+        aPoints.Append(BRep_Tool::Pnt(TopoDS::Vertex(anExpV.Current())));
+      }
+      TopExp_Explorer anExpE(aFM, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+        if (!BRep_Tool::Degenerated(aE))
+        {
+          BRepAdaptor_Curve aBAC(aE);
+          aPoints.Append(aBAC.Value((aBAC.FirstParameter() + aBAC.LastParameter()) / 2.));
+        }
+      }
+
+      NCollection_List<gp_Pnt>::Iterator itP(aPoints);
+      for (; itP.More(); itP.Next())
+      {
+        GeomAPI_ProjectPointOnSurf aProj(itP.Value(), aS);
+        if (!aProj.IsDone() || aProj.NbPoints() == 0)
+        {
+          continue;
+        }
+        double aU, aV;
+        aProj.LowerDistanceParameters(aU, aV);
+        // Bring the periodic parameters next to the domain of the representative
+        if (aUPeriod > 0.)
+        {
+          const double aUMid = (aUMin + aUMax) / 2.;
+          aU                 = ElCLib::InPeriod(aU, aUMid - aUPeriod / 2., aUMid + aUPeriod / 2.);
+        }
+        if (aVPeriod > 0.)
+        {
+          const double aVMid = (aVMin + aVMax) / 2.;
+          aV                 = ElCLib::InPeriod(aV, aVMid - aVPeriod / 2., aVMid + aVPeriod / 2.);
+        }
+        aUMin = std::min(aUMin, aU);
+        aUMax = std::max(aUMax, aU);
+        aVMin = std::min(aVMin, aV);
+        aVMax = std::max(aVMax, aV);
+      }
+    }
+
+    // Keep the domain within the surface
+    double aSUMin, aSUMax, aSVMin, aSVMax;
+    aS->Bounds(aSUMin, aSUMax, aSVMin, aSVMax);
+    if (aUPeriod > 0.)
+    {
+      aUMax = std::min(aUMax, aUMin + aUPeriod);
+    }
+    else
+    {
+      aUMin = std::max(aUMin, aSUMin);
+      aUMax = std::min(aUMax, aSUMax);
+    }
+    if (aVPeriod > 0.)
+    {
+      aVMax = std::min(aVMax, aVMin + aVPeriod);
+    }
+    else
+    {
+      aVMin = std::max(aVMin, aSVMin);
+      aVMax = std::min(aVMax, aSVMax);
+    }
+
+    BRepLib_MakeFace aMF(aS, aUMin, aUMax, aVMin, aVMax, aTol);
+    TopoDS_Face      aFace = aMF.Face();
+    if (aFRep.Orientation() == TopAbs_REVERSED)
+    {
+      aFace.Reverse();
+    }
+    return aFace;
   }
 
   //! Trims the extended adjacent faces by intersection with each other
@@ -712,13 +976,15 @@ private: //! @name Private methods performing the operation
   {
     // Intersect the extended faces first
     BOPAlgo_Builder aGFInter;
-    // Add faces for intersection
-    const int aNbF = theFaceExtFaceMap.Extent();
-    for (int i = 1; i <= aNbF; ++i)
+    // Add faces for intersection (the faces of a group of coincident faces share one)
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> anExtFaces;
+    for (int i = 1; i <= theFaceExtFaceMap.Extent(); ++i)
     {
-      aGFInter.AddArgument(theFaceExtFaceMap(i));
+      if (anExtFaces.Add(theFaceExtFaceMap(i)))
+      {
+        aGFInter.AddArgument(theFaceExtFaceMap(i));
+      }
     }
-
     aGFInter.SetRunParallel(myRunParallel);
     aGFInter.SetFuzzyValue(myFuzzyValue);
 
@@ -758,20 +1024,22 @@ private: //! @name Private methods performing the operation
     NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aFeatureEdgesMap;
     TopExp::MapShapes(myFeature, TopAbs_EDGE, aFeatureEdgesMap);
 
-    Message_ProgressScope aPS(aPSOuter.Next(), "Trimming faces", aNbF);
-    for (int i = 1; i <= aNbF && aPS.More(); ++i, aPS.Next())
+    const int             aNbG = myGroups.Extent();
+    Message_ProgressScope aPS(aPSOuter.Next(), "Trimming faces", aNbG);
+    for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
     {
-      const TopoDS_Face& aFOriginal = TopoDS::Face(theFaceExtFaceMap.FindKey(i));
-      const TopoDS_Face& aFExt      = TopoDS::Face(theFaceExtFaceMap(i));
-      TrimFace(aFExt, aFOriginal, aFeatureEdgesMap, anEFExtMap, theFaceExtFaceMap, aGFInter);
+      const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
+      const TopoDS_Face& aFExt = TopoDS::Face(theFaceExtFaceMap.FindFromKey(aMembers.First()));
+      TrimFace(aFExt, aMembers, aFeatureEdgesMap, anEFExtMap, theFaceExtFaceMap, aGFInter);
     }
   }
 
-  //! Trim the extended faces by the bounds of the original face,
-  //! except those contained in the feature to remove.
+  //! Trims the extended face by the bounds of the original faces it has been built
+  //! from (a face, or the faces of a group of coincident faces), except those
+  //! contained in the feature to remove.
   void TrimFace(
     const TopoDS_Face&                                                   theFExt,
-    const TopoDS_Face&                                                   theFOriginal,
+    const NCollection_List<TopoDS_Shape>&                                theOriginals,
     const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theFeatureEdgesMap,
     const NCollection_IndexedDataMap<TopoDS_Shape,
                                      NCollection_List<TopoDS_Shape>,
@@ -819,13 +1087,23 @@ private: //! @name Private methods performing the operation
     // A split containing such an edge as INTERNAL legitimately spans both its sides
     // (e.g. two patches of one surface both adjacent to the feature).
     NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMInternalOK;
-    anExpE.Init(theFOriginal, TopAbs_EDGE);
-    for (; anExpE.More(); anExpE.Next())
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMToolsAdded;
+    NCollection_List<TopoDS_Shape>::Iterator               itO(theOriginals);
+    for (; itO.More(); itO.Next())
     {
-      const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
-      if (!theFeatureEdgesMap.Contains(aE))
+      const TopoDS_Face& aFOriginal = TopoDS::Face(itO.Value());
+      anExpE.Init(aFOriginal, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
       {
-        aGFTrim.AddArgument(aE);
+        const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+        if (theFeatureEdgesMap.Contains(aE))
+        {
+          continue;
+        }
+        if (aMToolsAdded.Add(aE))
+        {
+          aGFTrim.AddArgument(aE);
+        }
         const NCollection_List<TopoDS_Shape>* pLF = myEFMap->Seek(aE);
         if (pLF)
         {
@@ -834,7 +1112,7 @@ private: //! @name Private methods performing the operation
           for (; itLF.More(); itLF.Next())
           {
             const TopoDS_Shape& aFOther = itLF.Value();
-            if (aFOther.IsSame(theFOriginal))
+            if (aFOther.IsSame(aFOriginal))
             {
               continue;
             }
@@ -849,8 +1127,9 @@ private: //! @name Private methods performing the operation
             aMInternalOK.Add(aE);
           }
         }
-        if (!BRep_Tool::Degenerated(aE) && !BRep_Tool::IsClosed(aE, theFOriginal))
+        if (!BRep_Tool::Degenerated(aE) && !BRep_Tool::IsClosed(aE, aFOriginal))
         {
+          // The edges shared by the faces of the group are inside the rebuilt face
           if (!aMEdgesToCheckOri.Add(aE))
           {
             aMEdgesToCheckOri.Remove(aE);
@@ -1005,7 +1284,10 @@ private: //! @name Private methods performing the operation
       // Remove the internal edges and vertices from the faces
       RemoveInternalWires(aLFTrimmed);
 
-      myFaces.Add(theFOriginal, aLFTrimmed);
+      for (itO.Initialize(theOriginals); itO.More(); itO.Next())
+      {
+        myFaces.Add(itO.Value(), aLFTrimmed);
+      }
 
       // Remember the splits whose orientation is confirmed by an edge of the original face;
       // they are the trusted evidence for classifying the cells built by MakerVolume.
@@ -1056,6 +1338,7 @@ private: //! @name Fields
 
   // Results
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureFacesMap;              //!< Faces of the feature
+  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myGroups; //!< Groups of adjacent faces lying on the same surface, by their first face
   bool myHasAdjacentFaces;                //!< Flag to show whether the adjacent faces have been found or not
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myFaces;  //!< Reconstructed adjacent faces
@@ -1265,10 +1548,33 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   // Add faces of the input shape
   aMV.AddArgument(anOrigF);
 
-  // Add reconstructed adjacent faces
+  // Add reconstructed adjacent faces. The faces rebuilt as a group of coincident
+  // faces share their images, which are added once.
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAdjImagesAdded;
   for (int i = 1; i <= aNbAF; ++i)
   {
-    const NCollection_List<TopoDS_Shape>& aLFA = theAdjFaces(i);
+    if (HasHistory())
+    {
+      // Look for internal edges in the original adjacent faces
+      const TopoDS_Shape& aFOr = theAdjFaces.FindKey(i);
+      FindInternals(aFOr, anInternalShapes);
+    }
+
+    NCollection_List<TopoDS_Shape>           aLFA;
+    NCollection_List<TopoDS_Shape>::Iterator itLFAIm(theAdjFaces(i));
+    for (; itLFAIm.More(); itLFAIm.Next())
+    {
+      if (anAdjImagesAdded.Add(itLFAIm.Value()))
+      {
+        aLFA.Append(itLFAIm.Value());
+      }
+    }
+    if (aLFA.IsEmpty())
+    {
+      // The images have already been added with another face of the group
+      continue;
+    }
+
     if (aLFA.Extent() == 1)
     {
       const TopoDS_Shape& aFA = aLFA.First();
@@ -1288,13 +1594,6 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
 
       aMV.AddArgument(anAdjF);
       aFacesToBeKept.Add(anAdjF);
-    }
-
-    if (HasHistory())
-    {
-      // Look for internal edges in the original adjacent faces
-      const TopoDS_Shape& aFOr = theAdjFaces.FindKey(i);
-      FindInternals(aFOr, anInternalShapes);
     }
   }
 

@@ -45,6 +45,12 @@ const double THE_POCKET_TILT     = 7.0; // degrees
 const double THE_TOOL_HEIGHT     = 5.0;
 const double THE_BLEND_RADIUS    = 0.5;
 
+const double THE_BOX_LENGTH   = 60.0;
+const double THE_BOX_WIDTH    = 40.0;
+const double THE_BOX_HEIGHT   = 20.0;
+const double THE_GROOVE_WIDTH = 10.0;
+const double THE_GROOVE_DEPTH = 10.0;
+
 int CountFaces(const TopoDS_Shape& theShape)
 {
   ShapeMap aMap;
@@ -266,6 +272,81 @@ void CheckBlendsRemoved(const PocketModel& theModel, const int theNbBlends)
   // the wall and the floor.
   EXPECT_EQ(8, CountFaces(aResult));
 }
+
+//! A blank with a feature cut into it.
+struct CutModel
+{
+  TopoDS_Shape                   myBlank;   //!< the blank the feature has been cut into
+  TopoDS_Shape                   myCut;     //!< the blank with the feature
+  NCollection_List<TopoDS_Shape> myFeature; //!< the faces of the feature
+};
+
+//! Cut the tool out of the blank; the faces of the feature are the traces of the
+//! faces of the tool in the result.
+CutModel MakeCut(const TopoDS_Shape& theBlank, const TopoDS_Shape& theTool)
+{
+  CutModel aModel;
+  aModel.myBlank = theBlank;
+
+  BRepAlgoAPI_Cut aCut(theBlank, theTool);
+  if (!aCut.IsDone())
+  {
+    return aModel;
+  }
+  aModel.myCut = aCut.Shape();
+
+  TopExp_Explorer anExpF(theTool, TopAbs_FACE);
+  for (; anExpF.More(); anExpF.Next())
+  {
+    NCollection_List<TopoDS_Shape> aTraces = aCut.Modified(anExpF.Current());
+    aModel.myFeature.Append(aTraces);
+  }
+  return aModel;
+}
+
+//! Remove the feature of the model and check that the blank is restored.
+void CheckCutRemoved(const CutModel& theModel)
+{
+  ASSERT_FALSE(theModel.myCut.IsNull()) << "failed to cut the feature";
+  ASSERT_FALSE(theModel.myFeature.IsEmpty()) << "the feature was not found";
+
+  BRepAlgoAPI_Defeaturing aDefeaturing;
+  aDefeaturing.SetShape(theModel.myCut);
+  aDefeaturing.AddFacesToRemove(theModel.myFeature);
+  aDefeaturing.Build();
+
+  ASSERT_TRUE(aDefeaturing.IsDone());
+  EXPECT_FALSE(aDefeaturing.HasWarnings()) << "the feature was not removed";
+
+  const TopoDS_Shape aResult = aDefeaturing.Shape();
+  EXPECT_TRUE(BRepCheck_Analyzer(aResult).IsValid());
+
+  // Removing the feature must give back exactly the blank it was cut into.
+  EXPECT_NEAR(BOPTest_Utilities::GetVolume(theModel.myBlank),
+              BOPTest_Utilities::GetVolume(aResult),
+              1.0e-3);
+  EXPECT_EQ(CountFaces(theModel.myBlank), CountFaces(aResult));
+}
+
+//! A box with a groove running across its whole width, so that the top face
+//! of the box is split into two faces lying on the same plane. Either of them,
+//! extended over the groove, covers the gap left by the groove entirely.
+CutModel MakeGroovedBox()
+{
+  const TopoDS_Shape aBox =
+    BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 0.0),
+                        gp_Pnt(THE_BOX_LENGTH, THE_BOX_WIDTH, THE_BOX_HEIGHT))
+      .Shape();
+  const TopoDS_Shape aGroove =
+    BRepPrimAPI_MakeBox(gp_Pnt(THE_BOX_LENGTH / 2.0 - THE_GROOVE_WIDTH / 2.0,
+                               -1.0,
+                               THE_BOX_HEIGHT - THE_GROOVE_DEPTH),
+                        gp_Pnt(THE_BOX_LENGTH / 2.0 + THE_GROOVE_WIDTH / 2.0,
+                               THE_BOX_WIDTH + 1.0,
+                               THE_BOX_HEIGHT + 1.0))
+      .Shape();
+  return MakeCut(aBox, aGroove);
+}
 } // namespace
 
 // The extension of the adjacent faces used to be sized by the bounding box of
@@ -320,4 +401,12 @@ TEST(BRepAlgoAPI_DefeaturingTest, SplitWallPocket_SeamOffCentre_PocketNotSealed)
 TEST(BRepAlgoAPI_DefeaturingTest, EnclosedWallPocket_WallFullyOnBlends_BlendsRemoved)
 {
   CheckBlendsRemoved(MakeTiltedPocket(0.0, false), 7);
+}
+
+// The groove splits the top face of the box in two faces of one plane, and
+// each of them extended over the groove covers the gap. The two faces are
+// rebuilt as one face over the union of their parametric domains.
+TEST(BRepAlgoAPI_DefeaturingTest, GrooveAcrossBox_TopFaceSplitInTwo_GrooveRemoved)
+{
+  CheckCutRemoved(MakeGroovedBox());
 }
