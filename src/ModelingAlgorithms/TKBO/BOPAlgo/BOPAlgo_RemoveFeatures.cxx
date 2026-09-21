@@ -33,6 +33,7 @@
 #include <BRep_Tool.hxx>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
 
 #include <BRepBndLib.hxx>
 
@@ -47,6 +48,8 @@
 #include <Geom2d_Curve.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomConvert_SurfToAnaSurf.hxx>
+
+#include <Geom2d_Curve.hxx>
 
 #include <NCollection_DynamicArray.hxx>
 
@@ -471,21 +474,25 @@ public: //! @name Perform the operation
         return;
       }
 
-      // The extension length is derived from the size of the feature, which may be too
-      // small for the extended adjacent faces to reach each other. In that case trimming
-      // of the extended faces degenerates and the untrimmed extensions leak into the
-      // result, making the reconstruction unusable. Retry with a longer extension,
-      // keeping the best reconstruction if none of the attempts succeeds completely.
+      // Map the edges of the feature to avoid them during the trim
+      TopExp::MapShapes(myFeature, TopAbs_EDGE, myFeatureEdgesMap);
+
+      // Most features (holes, pockets, bosses) lie within the parametric domains of the
+      // adjacent faces, so the faces are first rebuilt over their domains without any
+      // extension. If the trim of some face degenerates, the faces are extended by the
+      // size of the feature, which may still be too small for the extended faces to
+      // reach each other - the extension is then doubled on each following attempt.
+      // The best reconstruction is kept if none of the attempts succeeds completely.
       Bnd_Box aFeatureBox;
       BRepBndLib::Add(myFeature, aFeatureBox);
       const double aFeatureSize = sqrt(aFeatureBox.SquareExtent());
 
       // The distance at which the adjacent surfaces meet is not related to the size of
       // the feature - for faces meeting at a small angle it grows without bound - so the
-      // number of attempts is taken from the size of the solids the feature belongs to.
-      // The last attempt is then the first extension spanning the whole model; beyond
-      // that length the extended faces already cover it and doubling cannot bring them
-      // together anymore.
+      // number of extension attempts is taken from the size of the solids the feature
+      // belongs to. The last attempt is then the first extension spanning the whole
+      // model; beyond that length the extended faces already cover it and doubling
+      // cannot bring them together anymore.
       Bnd_Box aSolidsBox;
       for (int i = 1; i <= mySolids.Extent(); ++i)
       {
@@ -493,10 +500,11 @@ public: //! @name Perform the operation
       }
       const double aSolidsSize = aSolidsBox.IsVoid() ? 0.0 : sqrt(aSolidsBox.SquareExtent());
       const int    aNbAttempts =
-        (aSolidsSize > aFeatureSize)
+        1
+        + ((aSolidsSize > aFeatureSize)
              ? std::max(THE_NB_EXTENSION_ATTEMPTS,
-                     1 + static_cast<int>(std::ceil(std::log2(aSolidsSize / aFeatureSize))))
-             : THE_NB_EXTENSION_ATTEMPTS;
+                        1 + static_cast<int>(std::ceil(std::log2(aSolidsSize / aFeatureSize))))
+             : THE_NB_EXTENSION_ATTEMPTS);
 
       // The best reconstruction so far: the one with the most adjacent faces trimmed by
       // the bounds of their original faces. On a tie the shorter extension wins, as it
@@ -521,13 +529,13 @@ public: //! @name Perform the operation
 
         Message_ProgressScope aPSAttempt(aPSExt.Next(), nullptr, 2);
 
+        // No extension on the first attempt, then doubling from the size of the feature
+        const double anExtLength = (anAttempt == 0) ? 0.0 : std::ldexp(aFeatureSize, anAttempt - 1);
+
         // Extend the adjacent faces keeping the connection to the original faces
         NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>
           aFaceExtFaceMap;
-        ExtendAdjacentFaces(aMFAdjacent,
-                            aFeatureSize * (1 << anAttempt),
-                            aFaceExtFaceMap,
-                            aPSAttempt.Next());
+        ExtendAdjacentFaces(aMFAdjacent, anExtLength, aFaceExtFaceMap, aPSAttempt.Next());
         if (!aPSAttempt.More())
         {
           return;
@@ -719,13 +727,25 @@ private: //! @name Private methods performing the operation
     for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
     {
       const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
+      const TopoDS_Face&                    aFRep    = TopoDS::Face(myGroups.FindKey(i));
       const TopoDS_Face                     aF       = MakeGroupFace(aMembers);
-      // Extend the face
-      TopoDS_Face aFExt;
-      BRepLib::ExtendFace(aF, theExtLength, true, true, true, true, aFExt);
 
+      // Extend the face only in the parametric directions the feature lies in, to keep
+      // the extended faces from interfering with each other away from the feature
+      bool                                     anExtDirs[4] = {false, false, false, false};
       NCollection_List<TopoDS_Shape>::Iterator itM(aMembers);
       for (; itM.More(); itM.Next())
+      {
+        bool aMemberDirs[4];
+        FindExtensionDirections(TopoDS::Face(itM.Value()), aFRep, aMemberDirs);
+        for (int k = 0; k < 4; ++k)
+        {
+          anExtDirs[k] = anExtDirs[k] || aMemberDirs[k];
+        }
+      }
+      const TopoDS_Face aFExt = ExtendFace(aF, theExtLength, anExtDirs);
+
+      for (itM.Initialize(aMembers); itM.More(); itM.Next())
       {
         theFaceExtFaceMap.Add(itM.Value(), aFExt);
         myHistory->AddModified(itM.Value(), aFExt);
@@ -967,6 +987,170 @@ private: //! @name Private methods performing the operation
     return aFace;
   }
 
+  //! Rebuilds the face over its parametric domain and extends it by the given length
+  //! in the given directions (UMin, UMax, VMin, VMax). A small margin is added in all
+  //! directions, so that the bounds of the rebuilt face never coincide with the edges
+  //! of the original face trimming it.
+  static TopoDS_Face ExtendFace(const TopoDS_Face& theF,
+                                const double       theExtLength,
+                                const bool (&theExtDirs)[4])
+  {
+    Bnd_Box aBox;
+    BRepBndLib::Add(theF, aBox);
+    const double aMargin = THE_EXTENSION_MARGIN * std::max(theExtLength, sqrt(aBox.SquareExtent()));
+
+    TopoDS_Face aFExt;
+    BRepLib::ExtendFace(theF,
+                        aMargin,
+                        !theExtDirs[0],
+                        !theExtDirs[1],
+                        !theExtDirs[2],
+                        !theExtDirs[3],
+                        aFExt);
+    if (theExtDirs[0] || theExtDirs[1] || theExtDirs[2] || theExtDirs[3])
+    {
+      TopoDS_Face aFExt2;
+      BRepLib::ExtendFace(aFExt,
+                          theExtLength + aMargin,
+                          theExtDirs[0],
+                          theExtDirs[1],
+                          theExtDirs[2],
+                          theExtDirs[3],
+                          aFExt2);
+      aFExt = aFExt2;
+    }
+    return aFExt;
+  }
+
+  //! Finds the parametric directions in which the face has to be extended to cover the
+  //! gap left by the feature: the directions the feature edges of the face are facing.
+  //! A face touching the feature by closed loops of feature edges only (a face with a
+  //! hole in it) needs no extension - its surface already covers the gap.
+  //! The directions are expressed in the parametric space of the reference face:
+  //! the face itself, or the representative of its group of coincident faces.
+  void FindExtensionDirections(const TopoDS_Face& theF,
+                               const TopoDS_Face& theFRef,
+                               bool (&theExtDirs)[4]) const
+  {
+    theExtDirs[0] = theExtDirs[1] = theExtDirs[2] = theExtDirs[3] = false;
+
+    // Work with the forward face: the material is on the left of its edges
+    const TopoDS_Face         aFF = TopoDS::Face(theF.Oriented(TopAbs_FORWARD));
+    BRepAdaptor_Surface       aBAS(aFF, false);
+    const bool                isSameFace = theFRef.IsSame(theF);
+    occ::handle<Geom_Surface> aSRef;
+    if (!isSameFace)
+    {
+      aSRef = BRep_Tool::Surface(theFRef);
+    }
+
+    TopoDS_Iterator itW(aFF);
+    for (; itW.More(); itW.Next())
+    {
+      const TopoDS_Shape& aW = itW.Value();
+      if (aW.ShapeType() != TopAbs_WIRE)
+      {
+        continue;
+      }
+
+      // Skip the wires made of the feature edges only
+      bool            hasFeatureEdges = false, hasOtherEdges = false;
+      TopoDS_Iterator itE(aW);
+      for (; itE.More(); itE.Next())
+      {
+        if (BRep_Tool::Degenerated(TopoDS::Edge(itE.Value())))
+        {
+          continue;
+        }
+        (myFeatureEdgesMap.Contains(itE.Value()) ? hasFeatureEdges : hasOtherEdges) = true;
+      }
+      if (!hasFeatureEdges || !hasOtherEdges)
+      {
+        continue;
+      }
+
+      TopExp_Explorer anExpE(aW, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+        if (!myFeatureEdgesMap.Contains(aE) || BRep_Tool::Degenerated(aE))
+        {
+          continue;
+        }
+
+        double                    aFirst, aLast;
+        occ::handle<Geom2d_Curve> aC2d = BRep_Tool::CurveOnSurface(aE, aFF, aFirst, aLast);
+        if (aC2d.IsNull())
+        {
+          // No way to tell - extend everywhere
+          theExtDirs[0] = theExtDirs[1] = theExtDirs[2] = theExtDirs[3] = true;
+          return;
+        }
+
+        for (int i = 0; i < THE_NB_DIRECTION_SAMPLES; ++i)
+        {
+          const double aT = aFirst + (aLast - aFirst) * (i + 0.5) / THE_NB_DIRECTION_SAMPLES;
+          gp_Pnt2d     aP2d;
+          gp_Vec2d     aD2d;
+          aC2d->D1(aT, aP2d, aD2d);
+          if (aD2d.SquareMagnitude() < gp::Resolution())
+          {
+            continue;
+          }
+          if (aE.Orientation() == TopAbs_REVERSED)
+          {
+            aD2d.Reverse();
+          }
+          // The gap is on the right of the edge
+          const gp_Vec2d anOut(aD2d.Y(), -aD2d.X());
+
+          // Express the direction in the parametric space of the reference face, scaled
+          // to the 3D lengths to compare its components
+          gp_Pnt aP;
+          gp_Vec aDU, aDV;
+          aBAS.D1(aP2d.X(), aP2d.Y(), aP, aDU, aDV);
+          double aCU, aCV;
+          if (isSameFace)
+          {
+            aCU = anOut.X() * aDU.Magnitude();
+            aCV = anOut.Y() * aDV.Magnitude();
+          }
+          else
+          {
+            const gp_Vec               aDir3d = aDU * anOut.X() + aDV * anOut.Y();
+            GeomAPI_ProjectPointOnSurf aProj(aP, aSRef);
+            if (!aProj.IsDone() || aProj.NbPoints() == 0)
+            {
+              continue;
+            }
+            double aU, aV;
+            aProj.LowerDistanceParameters(aU, aV);
+            gp_Pnt aPRef;
+            gp_Vec aDURef, aDVRef;
+            aSRef->D1(aU, aV, aPRef, aDURef, aDVRef);
+            if (aDURef.SquareMagnitude() < gp::Resolution()
+                || aDVRef.SquareMagnitude() < gp::Resolution())
+            {
+              continue;
+            }
+            aCU = aDir3d.Dot(aDURef) / aDURef.Magnitude();
+            aCV = aDir3d.Dot(aDVRef) / aDVRef.Magnitude();
+          }
+          const double aMag = sqrt(aCU * aCU + aCV * aCV);
+          if (aMag < gp::Resolution())
+          {
+            continue;
+          }
+
+          theExtDirs[0] = theExtDirs[0] || (aCU < -THE_DIRECTION_THRESHOLD * aMag);
+          theExtDirs[1] = theExtDirs[1] || (aCU > THE_DIRECTION_THRESHOLD * aMag);
+          theExtDirs[2] = theExtDirs[2] || (aCV < -THE_DIRECTION_THRESHOLD * aMag);
+          theExtDirs[3] = theExtDirs[3] || (aCV > THE_DIRECTION_THRESHOLD * aMag);
+        }
+      }
+    }
+  }
+
   //! Trims the extended adjacent faces by intersection with each other
   //! and following intersection with the bounds of original faces.
   void TrimExtendedFaces(
@@ -1020,17 +1204,13 @@ private: //! @name Private methods performing the operation
     // Get the splits of the extended faces after intersection
     // and trim them by the edges of the original faces
 
-    // Map the edges of the Feature to avoid them during the trim
-    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aFeatureEdgesMap;
-    TopExp::MapShapes(myFeature, TopAbs_EDGE, aFeatureEdgesMap);
-
     const int             aNbG = myGroups.Extent();
     Message_ProgressScope aPS(aPSOuter.Next(), "Trimming faces", aNbG);
     for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
     {
       const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
       const TopoDS_Face& aFExt = TopoDS::Face(theFaceExtFaceMap.FindFromKey(aMembers.First()));
-      TrimFace(aFExt, aMembers, aFeatureEdgesMap, anEFExtMap, theFaceExtFaceMap, aGFInter);
+      TrimFace(aFExt, aMembers, anEFExtMap, theFaceExtFaceMap, aGFInter);
     }
   }
 
@@ -1038,12 +1218,11 @@ private: //! @name Private methods performing the operation
   //! from (a face, or the faces of a group of coincident faces), except those
   //! contained in the feature to remove.
   void TrimFace(
-    const TopoDS_Face&                                                   theFExt,
-    const NCollection_List<TopoDS_Shape>&                                theOriginals,
-    const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theFeatureEdgesMap,
+    const TopoDS_Face&                                         theFExt,
+    const NCollection_List<TopoDS_Shape>&                      theOriginals,
     const NCollection_IndexedDataMap<TopoDS_Shape,
                                      NCollection_List<TopoDS_Shape>,
-                                     TopTools_ShapeMapHasher>&           theEFExtMap,
+                                     TopTools_ShapeMapHasher>& theEFExtMap,
     const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
                      theFaceExtFaceMap,
     BOPAlgo_Builder& theGFInter)
@@ -1096,7 +1275,7 @@ private: //! @name Private methods performing the operation
       for (; anExpE.More(); anExpE.Next())
       {
         const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
-        if (theFeatureEdgesMap.Contains(aE))
+        if (myFeatureEdgesMap.Contains(aE))
         {
           continue;
         }
@@ -1338,6 +1517,7 @@ private: //! @name Fields
 
   // Results
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureFacesMap;              //!< Faces of the feature
+  NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureEdgesMap;       //!< Edges of the feature
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myGroups; //!< Groups of adjacent faces lying on the same surface, by their first face
   bool myHasAdjacentFaces;                //!< Flag to show whether the adjacent faces have been found or not
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
@@ -1352,6 +1532,16 @@ private: //! @name Fields
   //! Least number of attempts to extend the adjacent faces, each one doubling the
   //! extension length; more are made when the model is much larger than the feature
   static constexpr int THE_NB_EXTENSION_ATTEMPTS = 3;
+
+  //! Relative margin added to the extension of the adjacent faces in all directions
+  static constexpr double THE_EXTENSION_MARGIN = 0.01;
+
+  //! Number of points sampled on a feature edge to find the directions of the extension
+  static constexpr int THE_NB_DIRECTION_SAMPLES = 5;
+
+  //! Least component of the direction of the gap (relative to its length) for the face
+  //! to be extended in that parametric direction
+  static constexpr double THE_DIRECTION_THRESHOLD = 0.1;
 };
 
 typedef NCollection_DynamicArray<FillGap> VectorOfFillGap;
