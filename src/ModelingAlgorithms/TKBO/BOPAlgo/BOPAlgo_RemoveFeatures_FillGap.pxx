@@ -53,9 +53,11 @@ public: //! @name Constructors
   FillGap()
       : myRunParallel(false),
         myFuzzyValue(0.0),
+        myFeatureSize(0.0),
         myHasAdjacentFaces(false),
         myTrimDegenerated(false),
         myTrimFailed(false),
+        myIsExtensionExhausted(false),
         myNbDegenerated(0)
   {
   }
@@ -139,7 +141,7 @@ public: //! @name Perform the operation
       // The best reconstruction is kept if none of the attempts succeeds completely.
       Bnd_Box aFeatureBox;
       BRepBndLib::Add(myFeature, aFeatureBox);
-      const double aFeatureSize = sqrt(aFeatureBox.SquareExtent());
+      myFeatureSize = std::max(sqrt(aFeatureBox.SquareExtent()), Precision::Confusion());
 
       // The distance at which the adjacent surfaces meet is not related to the size of
       // the feature - for faces meeting at a small angle it grows without bound - so the
@@ -155,9 +157,9 @@ public: //! @name Perform the operation
       const double aSolidsSize = aSolidsBox.IsVoid() ? 0.0 : sqrt(aSolidsBox.SquareExtent());
       const int    aNbAttempts =
         1
-        + ((aSolidsSize > aFeatureSize)
+        + ((aSolidsSize > myFeatureSize)
              ? std::max(THE_NB_EXTENSION_ATTEMPTS,
-                        1 + static_cast<int>(std::ceil(std::log2(aSolidsSize / aFeatureSize))))
+                        1 + static_cast<int>(std::ceil(std::log2(aSolidsSize / myFeatureSize))))
              : THE_NB_EXTENSION_ATTEMPTS);
 
       // The best reconstruction so far: the one with the most adjacent faces trimmed by
@@ -178,7 +180,8 @@ public: //! @name Perform the operation
         Message_ProgressScope aPSAttempt(aPSExt.Next(), nullptr, 3);
 
         // No extension on the first attempt, then doubling from the size of the feature
-        const double anExtLength = (anAttempt == 0) ? 0.0 : std::ldexp(aFeatureSize, anAttempt - 1);
+        const double anExtLength =
+          (anAttempt == 0) ? 0.0 : std::ldexp(myFeatureSize, anAttempt - 1);
 
         // Extend the adjacent faces keeping the connection to the original faces
         NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>
@@ -192,16 +195,23 @@ public: //! @name Perform the operation
         const occ::handle<BRepTools_History> anExtHistory = myHistory;
 
         // Recover the boundaries between the tangent adjacent faces
-        RecoverTangentBoundaries(aFaceExtFaceMap, aFeatureBox, std::ldexp(aFeatureSize, anAttempt));
+        RecoverTangentBoundaries(aFaceExtFaceMap,
+                                 aFeatureBox,
+                                 std::ldexp(myFeatureSize, anAttempt));
 
         // Trim the extended faces. The tangent faces are not intersected with each other
-        // at first; if the reconstruction is not complete and some of their boundaries
-        // were guessed by the extension of a single end, the trim is repeated with these
-        // faces intersected as well.
-        bool isComplete = false;
+        // at first; if the trim of a face fails whose boundary with a tangent face was
+        // guessed by the extension of a single end, the trim is repeated with such faces
+        // intersected as well. That second trim is expensive on free-form faces, so it
+        // is made only for the extensions doing at least as well as the previous ones.
+        const int aBestQualityBefore = aBestQuality;
+        int       aQualityFirstPass  = -1;
+        bool      isComplete         = false;
         for (int aPass = 0; aPass < 2 && !isComplete; ++aPass)
         {
-          if (aPass == 1 && (myTrimFailed || !HasExtendedTangentBoundaries()))
+          if (aPass == 1
+              && (myTrimFailed || aQualityFirstPass < aBestQualityBefore
+                  || !HasFailedGuessedBoundaries()))
           {
             break;
           }
@@ -225,6 +235,10 @@ public: //! @name Perform the operation
           isComplete =
             !myTrimFailed && !myTrimDegenerated && myFaces.Extent() == aMFAdjacent.Extent();
           const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
+          if (aPass == 0)
+          {
+            aQualityFirstPass = aQuality;
+          }
           if (isComplete || aQuality > aBestQuality)
           {
             aBestQuality     = aQuality;
@@ -239,10 +253,15 @@ public: //! @name Perform the operation
         {
           break;
         }
-        if (myTrimFailed)
+        if (aQualityFirstPass < 0)
         {
           // The extended faces could not even be intersected -
           // a longer extension is not going to make it any better.
+          break;
+        }
+        if (myIsExtensionExhausted)
+        {
+          // None of the faces can be extended any further
           break;
         }
       }
@@ -412,6 +431,9 @@ private: //! @name Private methods performing the operation
       GroupCoincidentFaces(theMFAdjacent);
     }
 
+    // The extension is exhausted when no face can be extended any further
+    myIsExtensionExhausted = (theExtLength > 0.0);
+
     const int             aNbG = myGroups.Extent();
     Message_ProgressScope aPS(theRange, "Extending adjacent faces", aNbG);
     for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
@@ -433,7 +455,9 @@ private: //! @name Private methods performing the operation
           anExtDirs[k] = anExtDirs[k] || aMemberDirs[k];
         }
       }
-      const TopoDS_Face aFExt = ExtendFace(aF, theExtLength, anExtDirs);
+      bool              isExhausted = false;
+      const TopoDS_Face aFExt       = ExtendFace(aF, theExtLength, anExtDirs, isExhausted);
+      myIsExtensionExhausted        = myIsExtensionExhausted && isExhausted;
 
       for (itM.Initialize(aMembers); itM.More(); itM.Next())
       {
@@ -681,13 +705,24 @@ private: //! @name Private methods performing the operation
   //! in the given directions (UMin, UMax, VMin, VMax). A small margin is added in all
   //! directions, so that the bounds of the rebuilt face never coincide with the edges
   //! of the original face trimming it.
-  static TopoDS_Face ExtendFace(const TopoDS_Face& theF,
-                                const double       theExtLength,
-                                const bool (&theExtDirs)[4])
+  //! A face on a free-form surface is extended by no more than its own size or the
+  //! size of the feature, whichever is greater: the extrapolation of such a surface
+  //! further than that is meaningless, it curls and self-intersects. theIsExhausted
+  //! is set when the length was cut down that way.
+  TopoDS_Face ExtendFace(const TopoDS_Face& theF,
+                         const double       theExtLength,
+                         const bool (&theExtDirs)[4],
+                         bool& theIsExhausted)
   {
     Bnd_Box aBox;
     BRepBndLib::Add(theF, aBox);
-    const double aMargin = THE_EXTENSION_MARGIN * std::max(theExtLength, sqrt(aBox.SquareExtent()));
+    const double aFaceSize   = sqrt(aBox.SquareExtent());
+    const bool   isFreeForm  = !IsElementary(theF);
+    const double aMaxLength  = std::max(aFaceSize, myFeatureSize);
+    const double anExtLength = isFreeForm ? std::min(theExtLength, aMaxLength) : theExtLength;
+    theIsExhausted           = isFreeForm && theExtLength > aMaxLength;
+
+    const double aMargin = THE_EXTENSION_MARGIN * std::max(anExtLength, aFaceSize);
 
     TopoDS_Face aFExt;
     BRepLib::ExtendFace(theF,
@@ -701,7 +736,7 @@ private: //! @name Private methods performing the operation
     {
       TopoDS_Face aFExt2;
       BRepLib::ExtendFace(aFExt,
-                          theExtLength + aMargin,
+                          anExtLength + aMargin,
                           theExtDirs[0],
                           theExtDirs[1],
                           theExtDirs[2],
@@ -710,6 +745,23 @@ private: //! @name Private methods performing the operation
       aFExt = aFExt2;
     }
     return aFExt;
+  }
+
+  //! Checks whether the face lies on an elementary surface, which can be extended
+  //! exactly by any length
+  static bool IsElementary(const TopoDS_Face& theF)
+  {
+    switch (BRepAdaptor_Surface(theF, false).GetType())
+    {
+      case GeomAbs_Plane:
+      case GeomAbs_Cylinder:
+      case GeomAbs_Cone:
+      case GeomAbs_Sphere:
+      case GeomAbs_Torus:
+        return true;
+      default:
+        return false;
+    }
   }
 
   //! Finds the parametric directions in which the face has to be extended to cover the
@@ -1295,15 +1347,25 @@ private: //! @name Private methods performing the operation
     return aDist;
   }
 
-  //! Returns true if the boundary of some pair of tangent faces has been recovered by
-  //! the extension of a single end, which is a guess at the boundary
-  bool HasExtendedTangentBoundaries() const
+  //! Returns true if the trim of some face of a pair of tangent faces whose boundary
+  //! has been guessed by the extension of a single end has not succeeded: the face is
+  //! left out of the reconstruction, or its trim degenerated.
+  bool HasFailedGuessedBoundaries() const
   {
     for (int i = 0; i < myTangentPairs.Length(); ++i)
     {
-      if (myTangentPairs(i).NbExtended > 0)
+      const TangentPair& aPair = myTangentPairs(i);
+      if (aPair.NbExtended == 0)
       {
-        return true;
+        continue;
+      }
+      for (int k = 0; k < 2; ++k)
+      {
+        const TopoDS_Face& aF = (k == 0) ? aPair.Face1 : aPair.Face2;
+        if (!myFaces.Contains(aF) || myDegeneratedFaces.Contains(aF))
+        {
+          return true;
+        }
       }
     }
     return false;
@@ -1749,6 +1811,7 @@ private: //! @name Fields
 
   // Results
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureFacesMap;              //!< Faces of the feature
+  double myFeatureSize;                   //!< Size of the feature (the diagonal of its bounding box)
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureEdgesMap;       //!< Edges of the feature
   NCollection_DynamicArray<TangentPair> myTangentPairs;  //!< Pairs of adjacent faces tangent to each other
   NCollection_DynamicArray<OpenEnd> myOpenEnds;          //!< Ends of the edges between tangent faces cut off by the feature
@@ -1763,6 +1826,7 @@ private: //! @name Fields
   occ::handle<BRepTools_History> myHistory;                //!< History of the adjacent faces reconstruction
   bool myTrimDegenerated;                 //!< Flag to show that trimming of some extended face degenerated
   bool myTrimFailed;                      //!< Flag to show that the extended faces could not be intersected
+  bool myIsExtensionExhausted;            //!< Flag to show that no adjacent face can be extended any further
   int myNbDegenerated;                    //!< Number of the extended faces whose trimming degenerated
   // clang-format on
 
