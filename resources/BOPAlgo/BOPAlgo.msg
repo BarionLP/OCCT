@@ -83,6 +83,9 @@ Unsupported type of input shape
 .BOPAlgo_AlertUnableToRemoveTheFeature
 Unable to remove the feature
 
+.BOPAlgo_AlertUnableToRebuildAdjacentFace
+Unable to rebuild the face adjacent to the feature
+
 .BOPAlgo_AlertNoFacesToRemove
 No faces have been found for removal
 

@@ -13,10 +13,13 @@
 
 #include "BOPTest_Utilities.pxx"
 
+#include <BOPAlgo_Alerts.hxx>
+#include <Bnd_Box.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Defeaturing.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepCheck_Analyzer.hxx>
@@ -25,6 +28,8 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRep_Tool.hxx>
+
+#include <Message_Report.hxx>
 
 #include <TopExp.hxx>
 #include <TopTools_ShapeMapHasher.hxx>
@@ -523,4 +528,67 @@ TEST(BRepAlgoAPI_DefeaturingTest, DrilledRound_HoleSplittingTheBSplineRound_Hole
   const gp_Dir aDir(0.0, aSin45, -aSin45);
   const gp_Ax2 anAxis(aMiddle.Translated(gp_Vec(aDir) * -10.0), aDir);
   CheckCutRemoved(MakeDrilledRound(anAxis, THE_BIG_HOLE_RADIUS, true));
+}
+
+// The top face of a box cannot be removed: its four neighbours, extended,
+// never close the box again. Besides the warning that the feature has not
+// been removed, the neighbours which could not be rebuilt are reported.
+TEST(BRepAlgoAPI_DefeaturingTest, BoxTopFace_NotRemovable_AdjacentFacesReported)
+{
+  const TopoDS_Shape aBox =
+    BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 0.0),
+                        gp_Pnt(THE_BOX_LENGTH, THE_BOX_WIDTH, THE_BOX_HEIGHT))
+      .Shape();
+
+  // The top face: z = THE_BOX_HEIGHT everywhere.
+  TopoDS_Face aTop;
+  ShapeMap    aFaces;
+  TopExp::MapShapes(aBox, TopAbs_FACE, aFaces);
+  for (int anIndex = 1; anIndex <= aFaces.Extent() && aTop.IsNull(); ++anIndex)
+  {
+    Bnd_Box aBnd;
+    BRepBndLib::Add(aFaces(anIndex), aBnd);
+    double aXMin, aYMin, aZMin, aXMax, aYMax, aZMax;
+    aBnd.Get(aXMin, aYMin, aZMin, aXMax, aYMax, aZMax);
+    if (aZMin > THE_BOX_HEIGHT - 1.0)
+    {
+      aTop = TopoDS::Face(aFaces(anIndex));
+    }
+  }
+  ASSERT_FALSE(aTop.IsNull());
+
+  BRepAlgoAPI_Defeaturing aDefeaturing;
+  aDefeaturing.SetShape(aBox);
+  aDefeaturing.AddFaceToRemove(aTop);
+  aDefeaturing.Build();
+
+  ASSERT_TRUE(aDefeaturing.IsDone());
+  EXPECT_TRUE(aDefeaturing.HasWarning(STANDARD_TYPE(BOPAlgo_AlertUnableToRemoveTheFeature)));
+  EXPECT_TRUE(aDefeaturing.HasWarning(STANDARD_TYPE(BOPAlgo_AlertUnableToRebuildAdjacentFace)));
+
+  // Every reported face is a face of the box adjacent to the top face.
+  int                                                 aNbReported = 0;
+  const NCollection_List<occ::handle<Message_Alert>>& anAlerts =
+    aDefeaturing.GetReport()->GetAlerts(Message_Warning);
+  for (NCollection_List<occ::handle<Message_Alert>>::Iterator anIter(anAlerts); anIter.More();
+       anIter.Next())
+  {
+    occ::handle<BOPAlgo_AlertUnableToRebuildAdjacentFace> anAlert =
+      occ::down_cast<BOPAlgo_AlertUnableToRebuildAdjacentFace>(anIter.Value());
+    if (anAlert.IsNull())
+    {
+      continue;
+    }
+    ++aNbReported;
+    const TopoDS_Shape& aFace = anAlert->GetShape();
+    EXPECT_TRUE(aFaces.Contains(aFace));
+    EXPECT_FALSE(aFace.IsSame(aTop));
+  }
+  EXPECT_GT(aNbReported, 0);
+  EXPECT_LE(aNbReported, 4);
+
+  // The shape is returned unmodified.
+  EXPECT_NEAR(BOPTest_Utilities::GetVolume(aBox),
+              BOPTest_Utilities::GetVolume(aDefeaturing.Shape()),
+              1.0e-3);
 }

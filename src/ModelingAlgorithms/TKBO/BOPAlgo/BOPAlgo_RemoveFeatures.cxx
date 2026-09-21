@@ -547,6 +547,7 @@ public: //! @name Perform the operation
                                                              aFacesBest;
       occ::handle<BRepTools_History>                         aHistoryBest = myHistory;
       NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAnchoredBest;
+      NCollection_List<TopoDS_Shape>                         aDegeneratedBest;
       int                                                    aBestQuality = -1;
 
       Message_ProgressScope aPSExt(aPS.Next(2), nullptr, aNbAttempts);
@@ -588,6 +589,7 @@ public: //! @name Perform the operation
           myNbDegenerated   = 0;
           myFaces.Clear();
           myAnchoredFaces.Clear();
+          myDegeneratedFaces.Clear();
           myHistory = new BRepTools_History();
           myHistory->Merge(anExtHistory);
 
@@ -603,10 +605,11 @@ public: //! @name Perform the operation
           const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
           if (isComplete || aQuality > aBestQuality)
           {
-            aBestQuality   = aQuality;
-            aFacesBest     = myFaces;
-            anAnchoredBest = myAnchoredFaces;
-            aHistoryBest   = myHistory;
+            aBestQuality     = aQuality;
+            aFacesBest       = myFaces;
+            anAnchoredBest   = myAnchoredFaces;
+            aDegeneratedBest = myDegeneratedFaces;
+            aHistoryBest     = myHistory;
           }
         }
 
@@ -626,6 +629,17 @@ public: //! @name Perform the operation
       myFaces         = aFacesBest;
       myAnchoredFaces = anAnchoredBest;
       myHistory       = aHistoryBest;
+
+      // The adjacent faces which could not be rebuilt: the ones left out of the
+      // reconstruction and the ones kept untrimmed
+      myFacesNotRebuilt = aDegeneratedBest;
+      for (int i = 1; i <= aMFAdjacent.Extent(); ++i)
+      {
+        if (!myFaces.Contains(aMFAdjacent(i)))
+        {
+          myFacesNotRebuilt.Append(aMFAdjacent(i));
+        }
+      }
     }
     catch (Standard_Failure const&)
     {
@@ -633,6 +647,7 @@ public: //! @name Perform the operation
       myHasAdjacentFaces = true;
       myFaces.Clear();
       myAnchoredFaces.Clear();
+      myFacesNotRebuilt.Clear();
     }
   }
 
@@ -661,6 +676,9 @@ public: //! @name Obtain the result
   {
     return myAnchoredFaces;
   }
+
+  //! Returns the adjacent faces which could not be rebuilt
+  const NCollection_List<TopoDS_Shape>& FacesNotRebuilt() const { return myFacesNotRebuilt; }
 
   //! Returns the initial solids participating in the feature removal
   const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& Solids() const
@@ -2038,6 +2056,10 @@ private: //! @name Private methods performing the operation
       // length.
       myTrimDegenerated = true;
       ++myNbDegenerated;
+      for (itO.Initialize(theOriginals); itO.More(); itO.Next())
+      {
+        myDegeneratedFaces.Append(itO.Value());
+      }
       // Use all splits, including those having the bounds of extended face
       anExpF.ReInit();
       for (; anExpF.More(); anExpF.Next())
@@ -2114,6 +2136,8 @@ private: //! @name Fields
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myFaces;  //!< Reconstructed adjacent faces
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myAnchoredFaces; //!< Reconstructed faces validated by an edge of the original face
+  NCollection_List<TopoDS_Shape> myDegeneratedFaces; //!< Adjacent faces whose trimming degenerated in the current attempt
+  NCollection_List<TopoDS_Shape> myFacesNotRebuilt;  //!< Adjacent faces which could not be rebuilt
   occ::handle<BRepTools_History> myHistory;                //!< History of the adjacent faces reconstruction
   bool myTrimDegenerated;                 //!< Flag to show that trimming of some extended face degenerated
   bool myTrimFailed;                      //!< Flag to show that the extended faces could not be intersected
@@ -2245,6 +2269,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
                   aFG.HasAdjacentFaces(),
                   aFG.Faces(),
                   aFG.AnchoredFaces(),
+                  aFG.FacesNotRebuilt(),
                   aFG.History(),
                   isSolidsHistoryNeeded,
                   aPSLoop.Next());
@@ -2262,10 +2287,22 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
                                    NCollection_List<TopoDS_Shape>,
                                    TopTools_ShapeMapHasher>&           theAdjFaces,
   const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theAnchoredFaces,
+  const NCollection_List<TopoDS_Shape>&                                theFacesNotRebuilt,
   const occ::handle<BRepTools_History>&                                theAdjFacesHistory,
   const bool                                                           theSolidsHistoryNeeded,
   const Message_ProgressRange&                                         theRange)
 {
+  // Reports the feature as not removed, along with the adjacent faces which could
+  // not be rebuilt
+  auto aReportFailure = [&]() {
+    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+    NCollection_List<TopoDS_Shape>::Iterator itF(theFacesNotRebuilt);
+    for (; itF.More(); itF.Next())
+    {
+      AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itF.Value()));
+    }
+  };
+
   bool      bFuseShapes = true;
   const int aNbAF       = theAdjFaces.Extent();
   if (aNbAF == 0)
@@ -2275,7 +2312,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
       // The adjacent faces have been found for the feature,
       // but something went wrong during their rebuilding.
       // Add error
-      AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+      aReportFailure();
       return;
     }
 
@@ -2401,7 +2438,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   if (aMV.HasErrors())
   {
     // Add warning for the feature
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+    aReportFailure();
     return;
   }
 
@@ -2411,7 +2448,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   if (!anExpS.More())
   {
     // No solids have been built - add warning for the feature
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+    aReportFailure();
     return;
   }
 
@@ -2475,7 +2512,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   if (!bValid)
   {
     // Add warning for the feature
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+    aReportFailure();
     return;
   }
 
@@ -2497,7 +2534,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   if (aLSRes.Extent() != theSolids.Extent())
   {
     // Add warning for the feature
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
+    aReportFailure();
     return;
   }
   aPS.Next(3);

@@ -100,6 +100,9 @@ DEFINE_SIMPLE_ALERT(BOPAlgo_AlertNoFacesToRemove)
 //! Unable to remove the feature
 DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertUnableToRemoveTheFeature)
 
+//! Unable to rebuild the face adjacent to the feature
+DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertUnableToRebuildAdjacentFace)
+
 //! The Feature Removal algorithm has failed
 DEFINE_SIMPLE_ALERT(BOPAlgo_AlertRemoveFeaturesFailed)
 

@@ -97,6 +97,9 @@
 //! - *BOPAlgo_AlertUnableToRemoveTheFeature* - the warning alert is given to
 //!     inform the user the removal of the feature is not possible. The algorithm
 //!     will still try to remove the other features;
+//! - *BOPAlgo_AlertUnableToRebuildAdjacentFace* - the warning alert is given along
+//!     with the previous one for each face adjacent to the feature which could not
+//!     be rebuilt to cover the feature;
 //! - *BOPAlgo_AlertRemoveFeaturesFailed* - the error alert is given in case if
 //!     the operation was aborted by the unknown reason.
 //!
@@ -234,6 +237,10 @@ protected: //! @name Protected methods performing the removal
   //! @param[in] theHasAdjacentFaces  Shows whether the adjacent faces have been
   //!                                 found for the feature or not;
   //! @param[in] theAdjFaces  The reconstructed adjacent faces covering the feature;
+  //! @param[in] theAnchoredFaces  The reconstructed faces validated by an edge of
+  //!                              the original adjacent face;
+  //! @param[in] theFacesNotRebuilt  The adjacent faces which could not be rebuilt,
+  //!                                reported if the feature is not removed;
   //! @param[in] theAdjFacesHistory  The history of the adjacent faces reconstruction;
   //! @param[in] theSolidsHistoryNeeded  Defines whether the history of solids
   //!                                    modifications should be tracked or not.
@@ -246,6 +253,7 @@ protected: //! @name Protected methods performing the removal
                                      NCollection_List<TopoDS_Shape>,
                                      TopTools_ShapeMapHasher>&           theAdjFaces,
     const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theAnchoredFaces,
+    const NCollection_List<TopoDS_Shape>&                                theFacesNotRebuilt,
     const occ::handle<BRepTools_History>&                                theAdjFacesHistory,
     const bool                                                           theSolidsHistoryNeeded,
     const Message_ProgressRange&                                         theRange);

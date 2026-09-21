@@ -2960,6 +2960,7 @@ On the low-level the history information is collected by the history tool *BRepT
 * *BOPAlgo_AlertUnsupportedType* - the alert will be given as an error if the input shape does not contain any solids, and as a warning if the input shape contains not only solids, but also other shapes;
 * *BOPAlgo_AlertNoFacesToRemove* - the error alert is given in case there are no faces to remove from the shape (nothing to do);
 * *BOPAlgo_AlertUnableToRemoveTheFeature* - the warning alert is given to inform the user the removal of the feature is not possible. The algorithm will still try to remove the other features;
+* *BOPAlgo_AlertUnableToRebuildAdjacentFace* - the warning alert is given along with the previous one for each face adjacent to the feature which could not be rebuilt to cover the feature;
 * *BOPAlgo_AlertRemoveFeaturesFailed* - the error alert is given in case if the operation was aborted by the unknown reason.
 
 For more information on the error/warning reporting system, see the chapter @ref specification__boolean_ers "Errors and warnings reporting system" of Boolean operations user guide.
