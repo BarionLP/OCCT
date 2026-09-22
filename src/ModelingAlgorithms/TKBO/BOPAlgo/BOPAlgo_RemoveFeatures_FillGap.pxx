@@ -495,6 +495,31 @@ private: //! @name Private methods performing the operation
           aMembers.Append(aFOther);
         }
       }
+      // The group is rebuilt on the surface of its first member: let it be the largest
+      // one, whose parametric domain covers most of the group, rather than whichever
+      // member happened to be found first
+      if (aMembers.Extent() > 1)
+      {
+        NCollection_List<TopoDS_Shape>::Iterator itLargest;
+        double                                   aLargestSize = -1.;
+        for (NCollection_List<TopoDS_Shape>::Iterator itM(aMembers); itM.More(); itM.Next())
+        {
+          Bnd_Box aBox;
+          BRepBndLib::Add(itM.Value(), aBox);
+          const double aSize = aBox.IsVoid() ? 0. : aBox.SquareExtent();
+          if (aSize > aLargestSize)
+          {
+            aLargestSize = aSize;
+            itLargest    = itM;
+          }
+        }
+        if (itLargest.More() && !itLargest.Value().IsSame(aMembers.First()))
+        {
+          const TopoDS_Shape aLargest = itLargest.Value();
+          aMembers.Remove(itLargest);
+          aMembers.Prepend(aLargest);
+        }
+      }
     }
   }
 
@@ -618,7 +643,9 @@ private: //! @name Private methods performing the operation
     double       aTol     = BRep_Tool::Tolerance(aFRep);
 
     // Enlarge the parametric domain of the representative to cover the other
-    // members: the projections of their vertices and of the middles of their edges
+    // members: the projections of the corners of their parametric domains and of points
+    // sampled along their edges - the extreme point of a curved edge lies between its
+    // vertices, so the vertices and the middles of the edges alone can cut it off
     NCollection_List<TopoDS_Shape>::Iterator itM(theMembers);
     for (itM.Next(); itM.More(); itM.Next())
     {
@@ -626,10 +653,14 @@ private: //! @name Private methods performing the operation
       aTol                   = std::max(aTol, BRep_Tool::Tolerance(aFM));
 
       NCollection_List<gp_Pnt> aPoints;
-      TopExp_Explorer          anExpV(aFM, TopAbs_VERTEX);
-      for (; anExpV.More(); anExpV.Next())
       {
-        aPoints.Append(BRep_Tool::Pnt(TopoDS::Vertex(anExpV.Current())));
+        double aMU1, aMU2, aMV1, aMV2;
+        BRepTools::UVBounds(aFM, aMU1, aMU2, aMV1, aMV2);
+        occ::handle<Geom_Surface> aSM = BRep_Tool::Surface(aFM);
+        aPoints.Append(aSM->Value(aMU1, aMV1));
+        aPoints.Append(aSM->Value(aMU2, aMV1));
+        aPoints.Append(aSM->Value(aMU1, aMV2));
+        aPoints.Append(aSM->Value(aMU2, aMV2));
       }
       TopExp_Explorer anExpE(aFM, TopAbs_EDGE);
       for (; anExpE.More(); anExpE.Next())
@@ -638,7 +669,12 @@ private: //! @name Private methods performing the operation
         if (!BRep_Tool::Degenerated(aE))
         {
           BRepAdaptor_Curve aBAC(aE);
-          aPoints.Append(aBAC.Value((aBAC.FirstParameter() + aBAC.LastParameter()) / 2.));
+          const int         aNbSamples = 8;
+          for (int k = 0; k <= aNbSamples; ++k)
+          {
+            aPoints.Append(aBAC.Value(aBAC.FirstParameter()
+                                      + (aBAC.LastParameter() - aBAC.FirstParameter()) * k / aNbSamples));
+          }
         }
       }
 
