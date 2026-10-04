@@ -480,23 +480,62 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     bool isSolidsHistoryNeeded = HasHistory() || (i < (aNbF - 1));
 
     // Perform removal of the single feature
-    RemoveFeature(aFG.Feature(),
-                  aFG.Solids(),
-                  aFG.FeatureFacesMap(),
-                  aFG.HasAdjacentFaces(),
-                  aFG.Faces(),
-                  aFG.AnchoredFaces(),
-                  aFG.FacesNotRebuilt(),
-                  aFG.History(),
-                  isSolidsHistoryNeeded,
-                  aPSLoop.Next());
+    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 2);
+    if (RemoveFeature(aFG.Solids(),
+                      aFG.FeatureFacesMap(),
+                      aFG.HasAdjacentFaces(),
+                      aFG.Faces(),
+                      aFG.AnchoredFaces(),
+                      aFG.History(),
+                      isSolidsHistoryNeeded,
+                      aPSFeature.Next()))
+    {
+      continue;
+    }
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
+
+    // The adjacent faces extended by the size of the whole feature have not closed the
+    // solid. The gap next to an adjacent face is as wide as the part of the feature the
+    // face borders, which is much smaller than the whole feature for long features (ribs,
+    // grooves) and features made of parts of different sizes; the faces extended that far
+    // interfere with each other away from the gap. Retry the feature with every face
+    // extended by the size of the feature faces it borders.
+    FillGap aFGLocal;
+    aFGLocal.SetFeature(aFG.Feature());
+    aFGLocal.SetEFConnectionMap(anEFMap);
+    aFGLocal.SetFSConnectionMap(anFSMap);
+    aFGLocal.SetRunParallel(myRunParallel);
+    aFGLocal.SetFuzzyValue(myFuzzyValue);
+    aFGLocal.SetLocalExtension(true);
+    aFGLocal.Perform();
+    if (RemoveFeature(aFGLocal.Solids(),
+                      aFGLocal.FeatureFacesMap(),
+                      aFGLocal.HasAdjacentFaces(),
+                      aFGLocal.Faces(),
+                      aFGLocal.AnchoredFaces(),
+                      aFGLocal.History(),
+                      isSolidsHistoryNeeded,
+                      aPSFeature.Next()))
+    {
+      continue;
+    }
+
+    // Report the failure with the faces the first reconstruction could not rebuild
+    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(aFG.Feature()));
+    NCollection_List<TopoDS_Shape>::Iterator itF(aFG.FacesNotRebuilt());
+    for (; itF.More(); itF.Next())
+    {
+      AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itF.Value()));
+    }
   }
 }
 
 //=================================================================================================
 
-void BOPAlgo_RemoveFeatures::RemoveFeature(
-  const TopoDS_Shape&                                                  theFeature,
+bool BOPAlgo_RemoveFeatures::RemoveFeature(
   const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theSolids,
   const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theFeatureFacesMap,
   const bool                                                           theHasAdjacentFaces,
@@ -504,22 +543,10 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
                                    NCollection_List<TopoDS_Shape>,
                                    TopTools_ShapeMapHasher>&           theAdjFaces,
   const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theAnchoredFaces,
-  const NCollection_List<TopoDS_Shape>&                                theFacesNotRebuilt,
   const occ::handle<BRepTools_History>&                                theAdjFacesHistory,
   const bool                                                           theSolidsHistoryNeeded,
   const Message_ProgressRange&                                         theRange)
 {
-  // Reports the feature as not removed, along with the adjacent faces which could
-  // not be rebuilt
-  auto aReportFailure = [&]() {
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(theFeature));
-    NCollection_List<TopoDS_Shape>::Iterator itF(theFacesNotRebuilt);
-    for (; itF.More(); itF.Next())
-    {
-      AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itF.Value()));
-    }
-  };
-
   bool      bFuseShapes = true;
   const int aNbAF       = theAdjFaces.Extent();
   if (aNbAF == 0)
@@ -528,9 +555,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
     {
       // The adjacent faces have been found for the feature,
       // but something went wrong during their rebuilding.
-      // Add error
-      aReportFailure();
-      return;
+      return false;
     }
 
     // No adjacent faces have been found for the feature.
@@ -654,9 +679,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   aMV.Perform(aPS.Next(90));
   if (aMV.HasErrors())
   {
-    // Add warning for the feature
-    aReportFailure();
-    return;
+    return false;
   }
 
   // Result of MV operation
@@ -664,9 +687,8 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   TopExp_Explorer     anExpS(aSolids, TopAbs_SOLID);
   if (!anExpS.More())
   {
-    // No solids have been built - add warning for the feature
-    aReportFailure();
-    return;
+    // No solids have been built
+    return false;
   }
 
   // Now, it is necessary to:
@@ -681,7 +703,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
   {
     if (!aPS.More())
     {
-      return;
+      return false;
     }
     const TopoDS_Shape&                   aF    = theAdjFaces.FindKey(i);
     const NCollection_List<TopoDS_Shape>& aLFIm = myHistory->Modified(aF);
@@ -712,7 +734,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
     }
     if (!aPS.More())
     {
-      return;
+      return false;
     }
     TopExp_Explorer anExpF(aS, TopAbs_FACE);
     for (; anExpF.More(); anExpF.Next())
@@ -728,9 +750,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
 
   if (!bValid)
   {
-    // Add warning for the feature
-    aReportFailure();
-    return;
+    return false;
   }
 
   // It is possible that the result of MakerVolume operation contains
@@ -750,9 +770,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
 
   if (aLSRes.Extent() != theSolids.Extent())
   {
-    // Add warning for the feature
-    aReportFailure();
-    return;
+    return false;
   }
   aPS.Next(3);
   // Remove internal wires from the faces, possibly appeared after intersection
@@ -807,6 +825,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeature(
 
   // Save the result
   myShape = aCRes;
+  return true;
 }
 
 //=======================================================================

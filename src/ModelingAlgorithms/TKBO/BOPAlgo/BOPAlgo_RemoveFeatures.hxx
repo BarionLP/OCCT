@@ -231,7 +231,6 @@ protected: //! @name Protected methods performing the removal
   Standard_EXPORT void RemoveFeatures(const Message_ProgressRange& theRange);
 
   //! Remove the single feature from the shape.
-  //! @param[in] theFeature  The feature to remove;
   //! @param[in] theSolids  The solids to be reconstructed after feature removal;
   //! @param[in] theFeatureFacesMap  The map of feature faces;
   //! @param[in] theHasAdjacentFaces  Shows whether the adjacent faces have been
@@ -239,13 +238,11 @@ protected: //! @name Protected methods performing the removal
   //! @param[in] theAdjFaces  The reconstructed adjacent faces covering the feature;
   //! @param[in] theAnchoredFaces  The reconstructed faces validated by an edge of
   //!                              the original adjacent face;
-  //! @param[in] theFacesNotRebuilt  The adjacent faces which could not be rebuilt,
-  //!                                reported if the feature is not removed;
   //! @param[in] theAdjFacesHistory  The history of the adjacent faces reconstruction;
   //! @param[in] theSolidsHistoryNeeded  Defines whether the history of solids
   //!                                    modifications should be tracked or not.
-  Standard_EXPORT void RemoveFeature(
-    const TopoDS_Shape&                                                  theFeature,
+  //! @return true if the feature has been removed; the failure is not reported here.
+  Standard_EXPORT bool RemoveFeature(
     const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theSolids,
     const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theFeatureFacesMap,
     const bool                                                           theHasAdjacentFaces,
@@ -253,7 +250,6 @@ protected: //! @name Protected methods performing the removal
                                      NCollection_List<TopoDS_Shape>,
                                      TopTools_ShapeMapHasher>&           theAdjFaces,
     const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>&        theAnchoredFaces,
-    const NCollection_List<TopoDS_Shape>&                                theFacesNotRebuilt,
     const occ::handle<BRepTools_History>&                                theAdjFacesHistory,
     const bool                                                           theSolidsHistoryNeeded,
     const Message_ProgressRange&                                         theRange);

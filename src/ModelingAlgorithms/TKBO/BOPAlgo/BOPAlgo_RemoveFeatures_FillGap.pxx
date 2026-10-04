@@ -53,6 +53,7 @@ public: //! @name Constructors
   FillGap()
       : myRunParallel(false),
         myFuzzyValue(0.0),
+        myIsLocalExtension(false),
         myFeatureSize(0.0),
         myHasAdjacentFaces(false),
         myTrimDegenerated(false),
@@ -94,6 +95,10 @@ public: //! @name Setters/Getters
 
   //! Sets the fuzzy value for the intersections
   void SetFuzzyValue(const double theFuzz) { myFuzzyValue = theFuzz; }
+
+  //! Defines whether each adjacent face is extended by the size of the feature faces
+  //! it borders instead of the size of the whole feature
+  void SetLocalExtension(const bool theIsLocal) { myIsLocalExtension = theIsLocal; }
 
   //! Gets the History object
   const occ::handle<BRepTools_History>& History() { return myHistory; }
@@ -455,8 +460,14 @@ private: //! @name Private methods performing the operation
           anExtDirs[k] = anExtDirs[k] || aMemberDirs[k];
         }
       }
+
+      // In the local mode the extension is scaled down from the size of the whole feature to
+      // the size of the part of it the faces border
+      const double anExtLength =
+        myIsLocalExtension ? theExtLength * LocalFeatureSize(aMembers) / myFeatureSize : theExtLength;
+
       bool              isExhausted = false;
-      const TopoDS_Face aFExt       = ExtendFace(aF, theExtLength, anExtDirs, isExhausted);
+      const TopoDS_Face aFExt       = ExtendFace(aF, anExtLength, anExtDirs, isExhausted);
       myIsExtensionExhausted        = myIsExtensionExhausted && isExhausted;
 
       for (itM.Initialize(aMembers); itM.More(); itM.Next())
@@ -465,6 +476,44 @@ private: //! @name Private methods performing the operation
         myHistory->AddModified(itM.Value(), aFExt);
       }
     }
+  }
+
+  //! Returns the size (the diagonal of the box) of the feature faces sharing an edge with
+  //! the given faces, never greater than the size of the whole feature
+  double LocalFeatureSize(const NCollection_List<TopoDS_Shape>& theFaces) const
+  {
+    Bnd_Box                                                aBox;
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMFAdded;
+    NCollection_List<TopoDS_Shape>::Iterator               itF(theFaces);
+    for (; itF.More(); itF.Next())
+    {
+      TopExp_Explorer anExpE(itF.Value(), TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        if (!myFeatureEdgesMap.Contains(anExpE.Current()))
+        {
+          continue;
+        }
+        const NCollection_List<TopoDS_Shape>* pLF = myEFMap->Seek(anExpE.Current());
+        if (!pLF)
+        {
+          continue;
+        }
+        NCollection_List<TopoDS_Shape>::Iterator itLF(*pLF);
+        for (; itLF.More(); itLF.Next())
+        {
+          if (myFeatureFacesMap.Contains(itLF.Value()) && aMFAdded.Add(itLF.Value()))
+          {
+            BRepBndLib::Add(itLF.Value(), aBox);
+          }
+        }
+      }
+    }
+    if (aBox.IsVoid())
+    {
+      return myFeatureSize;
+    }
+    return std::min(std::max(sqrt(aBox.SquareExtent()), Precision::Confusion()), myFeatureSize);
   }
 
   //! Groups the adjacent faces lying on the same surface. The first face of each
@@ -1840,6 +1889,7 @@ private: //! @name Fields
   // clang-format off
   bool myRunParallel;                     //!< Defines the mode of processing of the single feature
   double myFuzzyValue;                    //!< Fuzzy value for the intersections
+  bool myIsLocalExtension;                //!< Extend each face by the size of the feature faces it borders
   TopoDS_Shape myFeature;                             //!< Feature to remove
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myEFMap; //!< EF Connection map to find adjacent faces
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myFSMap; //!< FS Connection map to find solids participating in the feature removal
