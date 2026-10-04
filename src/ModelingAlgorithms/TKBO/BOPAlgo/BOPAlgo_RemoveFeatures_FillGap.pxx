@@ -231,6 +231,10 @@ public: //! @name Perform the operation
           myHistory->Merge(anExtHistory);
 
           TrimExtendedFaces(aFaceExtFaceMap, aPass == 1, aPSAttempt.Next());
+          if (!aPSAttempt.More())
+          {
+            return;
+          }
 
           // The reconstruction is complete when every adjacent face has been trimmed by
           // the bounds of its original face. Otherwise it is rated by the number of the
@@ -1571,11 +1575,11 @@ private: //! @name Private methods performing the operation
 
     const int             aNbG = myGroups.Extent();
     Message_ProgressScope aPS(aPSOuter.Next(), "Trimming faces", aNbG);
-    for (int i = 1; i <= aNbG && aPS.More(); ++i, aPS.Next())
+    for (int i = 1; i <= aNbG && aPS.More(); ++i)
     {
       const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
       const TopoDS_Face& aFExt = TopoDS::Face(theFaceExtFaceMap.FindFromKey(aMembers.First()));
-      TrimFace(aFExt, aMembers, anEFExtMap, theFaceExtFaceMap, aGFInter);
+      TrimFace(aFExt, aMembers, anEFExtMap, theFaceExtFaceMap, aGFInter, aPS.Next());
     }
   }
 
@@ -1590,7 +1594,8 @@ private: //! @name Private methods performing the operation
                                      TopTools_ShapeMapHasher>& theEFExtMap,
     const NCollection_IndexedDataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>&
                      theFaceExtFaceMap,
-    BOPAlgo_Builder& theGFInter)
+    BOPAlgo_Builder&             theGFInter,
+    const Message_ProgressRange& theRange)
   {
     // Map all edges of the extended face, to filter the result of trim
     // from the faces containing these edges
@@ -1698,7 +1703,7 @@ private: //! @name Private methods performing the operation
     aGFTrim.SetFuzzyValue(myFuzzyValue);
     aGFTrim.SetNonDestructive(true);
 
-    aGFTrim.Perform();
+    aGFTrim.Perform(theRange);
     if (aGFTrim.HasErrors())
     {
       return;

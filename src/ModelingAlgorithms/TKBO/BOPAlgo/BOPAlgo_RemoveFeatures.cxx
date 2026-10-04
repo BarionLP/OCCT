@@ -480,7 +480,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     bool isSolidsHistoryNeeded = HasHistory() || (i < (aNbF - 1));
 
     // Perform removal of the single feature
-    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 2);
+    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 3);
     if (RemoveFeature(aFG.Solids(),
                       aFG.FeatureFacesMap(),
                       aFG.HasAdjacentFaces(),
@@ -510,7 +510,12 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     aFGLocal.SetRunParallel(myRunParallel);
     aFGLocal.SetFuzzyValue(myFuzzyValue);
     aFGLocal.SetLocalExtension(true);
+    aFGLocal.SetRange(aPSFeature.Next());
     aFGLocal.Perform();
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
     if (RemoveFeature(aFGLocal.Solids(),
                       aFGLocal.FeatureFacesMap(),
                       aFGLocal.HasAdjacentFaces(),
@@ -521,6 +526,10 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
                       aPSFeature.Next()))
     {
       continue;
+    }
+    if (UserBreak(aPSFeature))
+    {
+      return;
     }
 
     // Report the failure with the faces the first reconstruction could not rebuild
