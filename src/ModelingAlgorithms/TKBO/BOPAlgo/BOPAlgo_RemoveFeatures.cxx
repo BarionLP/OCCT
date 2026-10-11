@@ -36,6 +36,7 @@
 #include <BRepAdaptor_Surface.hxx>
 
 #include <BRepBndLib.hxx>
+#include <BRepCheck_Shell.hxx>
 
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
@@ -71,6 +72,9 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Iterator.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopLoc_Location.hxx>
 
@@ -110,6 +114,18 @@ static void GetOriginalFaces(
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>&       theSolidsToRebuild,
   NCollection_List<TopoDS_Shape>&                                      theSharedFaces,
   NCollection_List<TopoDS_Shape>&                                      theUnTouchedSolids);
+
+static TopoDS_Shape RebuildSolidLocally(
+  const TopoDS_Shape&                                           theSolid,
+  const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>& theFeatureFacesMap,
+  const NCollection_IndexedDataMap<TopoDS_Shape,
+                                   NCollection_List<TopoDS_Shape>,
+                                   TopTools_ShapeMapHasher>&    theAdjFaces,
+  const occ::handle<BRepTools_History>&                         theAdjFacesHistory,
+  const double                                                  theFuzzyValue,
+  const bool                                                    theRunParallel,
+  BOPAlgo_Builder&                                              theGF,
+  const Message_ProgressRange&                                  theRange);
 
 static void FindShape(const TopoDS_Shape& theSWhat,
                       const TopoDS_Shape& theSWhere,
@@ -615,6 +631,53 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
                    anUnTouchedSolids);
 
   aPS.Next(3);
+
+  // Usually the reconstructed adjacent faces fit into the gap left by the feature exactly, and
+  // the solid can be rebuilt by replacing them in its shell. That only needs the faces around
+  // them to be intersected with them, while the general reconstruction below intersects all
+  // faces of the solid and builds the solid from scratch, which takes most of the time of a
+  // small feature on a big model. Whenever the faces do not fit exactly, the general
+  // reconstruction takes over.
+  if (bFuseShapes && aSolidsToRebuild.Extent() == 1 && aSharedFaces.IsEmpty()
+      && anInternalShapes.IsEmpty())
+  {
+    BOPAlgo_Builder    aGFLocal;
+    const TopoDS_Shape aSolid = RebuildSolidLocally(aSolidsToRebuild(1),
+                                                    theFeatureFacesMap,
+                                                    theAdjFaces,
+                                                    theAdjFacesHistory,
+                                                    myFuzzyValue,
+                                                    myRunParallel,
+                                                    aGFLocal,
+                                                    aPS.Next(20));
+    if (!aSolid.IsNull())
+    {
+      myHistory->Merge(theAdjFacesHistory);
+      myHistory->Merge(aGFLocal.History());
+      if (theSolidsHistoryNeeded)
+      {
+        BRepTools_History aSolidsHistory;
+        aSolidsHistory.AddModified(aSolidsToRebuild(1), aSolid);
+        myHistory->Merge(aSolidsHistory);
+      }
+
+      TopoDS_Compound aCRes;
+      aBB.MakeCompound(aCRes);
+      aBB.Add(aCRes, aSolid);
+      NCollection_List<TopoDS_Shape>::Iterator itLS(anUnTouchedSolids);
+      for (; itLS.More(); itLS.Next())
+      {
+        aBB.Add(aCRes, itLS.Value());
+      }
+      myShape = aCRes;
+      return true;
+    }
+    if (UserBreak(aPS))
+    {
+      return false;
+    }
+  }
+
   // To avoid excessive intersection of the faces collect the faces
   // of the input shape into a compound
   TopoDS_Compound anOrigF;
@@ -685,7 +748,7 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
   }
 
   // Build solids
-  aMV.Perform(aPS.Next(90));
+  aMV.Perform(aPS.Next(70));
   if (aMV.HasErrors())
   {
     return false;
@@ -1673,4 +1736,376 @@ void FindSolid(const TopoDS_Shape&                                        theSol
       }
     }
   }
+}
+
+//=======================================================================
+// function: RebuildSolidLocally
+// purpose: Rebuilds the solid with the feature faces removed and the adjacent
+//          faces replaced by their reconstructed images directly in its shell.
+//          Only the faces of the solid touching the feature or adjacent faces or
+//          reaching into the region where the shell changes are intersected with
+//          the images. Returns a null shape if that is not cheaper than the general
+//          reconstruction or the images do not fit the rest of the shell exactly:
+//          a kept face is split by the intersection, an edge or vertex shared with
+//          the rest of the shell is changed, or the new shell is not closed, not
+//          manifold or not consistently oriented.
+//=======================================================================
+TopoDS_Shape RebuildSolidLocally(
+  const TopoDS_Shape&                                           theSolid,
+  const NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>& theFeatureFacesMap,
+  const NCollection_IndexedDataMap<TopoDS_Shape,
+                                   NCollection_List<TopoDS_Shape>,
+                                   TopTools_ShapeMapHasher>&    theAdjFaces,
+  const occ::handle<BRepTools_History>&                         theAdjFacesHistory,
+  const double                                                  theFuzzyValue,
+  const bool                                                    theRunParallel,
+  BOPAlgo_Builder&                                              theGF,
+  const Message_ProgressRange&                                  theRange)
+{
+  // The solid has to consist of a single shell
+  int aNbShells = 0;
+  for (TopoDS_Iterator itS(theSolid); itS.More(); itS.Next())
+  {
+    if (itS.Value().ShapeType() != TopAbs_SHELL || ++aNbShells > 1)
+    {
+      return TopoDS_Shape();
+    }
+  }
+
+  // Sort the faces of the solid into feature, adjacent and kept faces. All of the feature
+  // and adjacent faces have to be present unchanged (not modified by a previous feature).
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>        aFeatureFound, anAdjFound;
+  NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aRegionVertices;
+  NCollection_List<TopoDS_Shape>                                aKept;
+  for (TopExp_Explorer anExpF(theSolid, TopAbs_FACE); anExpF.More(); anExpF.Next())
+  {
+    const TopoDS_Shape& aF = anExpF.Current();
+    if (aF.Orientation() != TopAbs_FORWARD && aF.Orientation() != TopAbs_REVERSED)
+    {
+      return TopoDS_Shape();
+    }
+    const bool bFeature = theFeatureFacesMap.Contains(aF);
+    const bool bAdj     = !bFeature && theAdjFaces.Contains(aF);
+    if (!bFeature && !bAdj)
+    {
+      aKept.Append(aF);
+      continue;
+    }
+    (bFeature ? aFeatureFound : anAdjFound).Add(aF);
+    TopExp::MapShapes(aF, TopAbs_VERTEX, aRegionVertices);
+  }
+  if (aFeatureFound.Extent() != theFeatureFacesMap.Extent()
+      || anAdjFound.Extent() != theAdjFaces.Extent())
+  {
+    return TopoDS_Shape();
+  }
+
+  // The images of the adjacent faces (the faces of a group share their images)
+  NCollection_List<TopoDS_Shape>                         anImages;
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anImagesFence;
+  const int                                              aNbAF = theAdjFaces.Extent();
+  for (int i = 1; i <= aNbAF; ++i)
+  {
+    NCollection_List<TopoDS_Shape>::Iterator itLFIm(theAdjFaces(i));
+    for (; itLFIm.More(); itLFIm.Next())
+    {
+      if (anImagesFence.Add(itLFIm.Value()))
+      {
+        anImages.Append(itLFIm.Value());
+      }
+    }
+  }
+  if (anImages.IsEmpty())
+  {
+    return TopoDS_Shape();
+  }
+
+  // The region where the shell changes: the edges between the feature and the adjacent faces
+  // (the gap the images close) and the edges of the images that are neither edges of the solid
+  // nor their splits or copies (the images coincide with the original adjacent faces
+  // elsewhere). Tight boxes, as the box of a trimmed B-spline face covers its whole surface.
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aSolidEdges, anAdjEdges;
+  for (TopExp_Explorer anExpE(theSolid, TopAbs_EDGE); anExpE.More(); anExpE.Next())
+  {
+    aSolidEdges.Add(anExpE.Current());
+    NCollection_List<TopoDS_Shape>::Iterator itLE(theAdjFacesHistory->Modified(anExpE.Current()));
+    for (; itLE.More(); itLE.Next())
+    {
+      aSolidEdges.Add(itLE.Value());
+    }
+  }
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>::Iterator itMF(anAdjFound);
+  for (; itMF.More(); itMF.Next())
+  {
+    for (TopExp_Explorer anExpE(itMF.Value(), TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      anAdjEdges.Add(anExpE.Current());
+    }
+  }
+  Bnd_Box aRegion;
+  for (itMF.Initialize(aFeatureFound); itMF.More(); itMF.Next())
+  {
+    for (TopExp_Explorer anExpE(itMF.Value(), TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      if (anAdjEdges.Contains(anExpE.Current()))
+      {
+        BRepBndLib::AddOptimal(anExpE.Current(), aRegion, false, false);
+      }
+    }
+  }
+  NCollection_List<TopoDS_Shape>::Iterator itLF(anImages);
+  for (; itLF.More(); itLF.Next())
+  {
+    for (TopExp_Explorer anExpE(itLF.Value(), TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      if (!aSolidEdges.Contains(anExpE.Current()))
+      {
+        BRepBndLib::AddOptimal(anExpE.Current(), aRegion, false, false);
+      }
+    }
+  }
+  if (aRegion.IsVoid())
+  {
+    return TopoDS_Shape();
+  }
+  // Margin for the bulge of curved faces beyond the box of their boundary
+  aRegion.Enlarge(0.25 * std::sqrt(aRegion.SquareExtent()));
+
+  // The kept faces near the region: sharing a vertex with the feature or adjacent faces,
+  // or reaching into the region. The rest of the shell stays as it is.
+  NCollection_List<TopoDS_Shape> aNear, aFar;
+  for (itLF.Initialize(aKept); itLF.More(); itLF.Next())
+  {
+    const TopoDS_Shape& aF    = itLF.Value();
+    bool                bNear = false;
+    for (TopExp_Explorer anExpV(aF, TopAbs_VERTEX); anExpV.More() && !bNear; anExpV.Next())
+    {
+      bNear = aRegionVertices.Contains(anExpV.Current());
+    }
+    if (!bNear)
+    {
+      Bnd_Box aBox;
+      BRepBndLib::Add(aF, aBox);
+      bNear = !aBox.IsOut(aRegion);
+      if (bNear)
+      {
+        // Only the box of a free-form face is loose enough to be worth the cost of a tight one
+        const GeomAbs_SurfaceType aType = BRepAdaptor_Surface(TopoDS::Face(aF), false).GetType();
+        if (aType == GeomAbs_BSplineSurface || aType == GeomAbs_BezierSurface
+            || aType == GeomAbs_OffsetSurface || aType == GeomAbs_OtherSurface)
+        {
+          Bnd_Box aBoxTight;
+          BRepBndLib::AddOptimal(aF, aBoxTight, false, false);
+          bNear = !aBoxTight.IsOut(aRegion);
+        }
+      }
+    }
+    (bNear ? aNear : aFar).Append(aF);
+  }
+  // When most of the shell is near the region, the intersection costs as much as the
+  // general reconstruction, and nothing is gained
+  if (2 * aNear.Extent() > aKept.Extent())
+  {
+    return TopoDS_Shape();
+  }
+
+  // Intersect the images with the near faces and with each other. The near faces fit each
+  // other already, so they are passed as one argument and not intersected among themselves.
+  TopoDS_Compound aNearC;
+  BRep_Builder().MakeCompound(aNearC);
+  for (itLF.Initialize(aNear); itLF.More(); itLF.Next())
+  {
+    BRep_Builder().Add(aNearC, itLF.Value());
+  }
+  theGF.AddArgument(aNearC);
+  for (itLF.Initialize(anImages); itLF.More(); itLF.Next())
+  {
+    theGF.AddArgument(itLF.Value());
+  }
+  theGF.SetRunParallel(theRunParallel);
+  theGF.SetFuzzyValue(theFuzzyValue);
+  theGF.SetNonDestructive(true);
+  theGF.Perform(theRange);
+  if (theGF.HasErrors())
+  {
+    return TopoDS_Shape();
+  }
+
+  // Every face has to stay in one piece. An image may vanish (a sliver below the tolerance);
+  // if anything depended on it, the shell is left open, which is checked below.
+  for (int iL = 0; iL < 2; ++iL)
+  {
+    for (itLF.Initialize(iL == 0 ? aNear : anImages); itLF.More(); itLF.Next())
+    {
+      if ((iL == 0 && theGF.IsDeleted(itLF.Value())) || theGF.Modified(itLF.Value()).Extent() > 1)
+      {
+        return TopoDS_Shape();
+      }
+    }
+  }
+
+  // The edges and vertices the near faces share with the far ones have to stay unchanged
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aFarSubShapes;
+  for (itLF.Initialize(aFar); itLF.More(); itLF.Next())
+  {
+    for (TopExp_Explorer anExp(itLF.Value(), TopAbs_EDGE); anExp.More(); anExp.Next())
+    {
+      aFarSubShapes.Add(anExp.Current());
+    }
+    for (TopExp_Explorer anExp(itLF.Value(), TopAbs_VERTEX); anExp.More(); anExp.Next())
+    {
+      aFarSubShapes.Add(anExp.Current());
+    }
+  }
+  for (itLF.Initialize(aNear); itLF.More(); itLF.Next())
+  {
+    for (int iT = 0; iT < 2; ++iT)
+    {
+      TopExp_Explorer anExp(itLF.Value(), iT == 0 ? TopAbs_EDGE : TopAbs_VERTEX);
+      for (; anExp.More(); anExp.Next())
+      {
+        const TopoDS_Shape& aS = anExp.Current();
+        if (aFarSubShapes.Contains(aS) && (theGF.IsDeleted(aS) || !theGF.Modified(aS).IsEmpty()))
+        {
+          return TopoDS_Shape();
+        }
+      }
+    }
+  }
+
+  // Collect the faces of the new shell. The far faces and the unchanged near faces keep
+  // their orientation; the others are oriented by the faces they share edges with.
+  NCollection_List<TopoDS_Shape> aFixed, aToOrient;
+  aFixed.Append(aFar);
+  for (itLF.Initialize(aNear); itLF.More(); itLF.Next())
+  {
+    const NCollection_List<TopoDS_Shape>& aLIm = theGF.Modified(itLF.Value());
+    if (aLIm.IsEmpty())
+    {
+      aFixed.Append(itLF.Value());
+    }
+    else
+    {
+      aToOrient.Append(aLIm.First());
+    }
+  }
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anImagesRes;
+  for (itLF.Initialize(anImages); itLF.More(); itLF.Next())
+  {
+    if (theGF.IsDeleted(itLF.Value()))
+    {
+      continue;
+    }
+    const NCollection_List<TopoDS_Shape>& aLIm = theGF.Modified(itLF.Value());
+    aToOrient.Append(aLIm.IsEmpty() ? itLF.Value() : aLIm.First());
+    anImagesRes.Add(aToOrient.Last());
+  }
+
+  // Orientations of the edges in the oriented faces (seams and degenerated edges skipped)
+  NCollection_DataMap<TopoDS_Shape, TopAbs_Orientation, TopTools_ShapeMapHasher> anEdgeOri;
+  auto isUsable = [](const TopoDS_Edge& theE, const TopoDS_Face& theF) {
+    return !BRep_Tool::Degenerated(theE) && !BRep_Tool::IsClosed(theE, theF);
+  };
+  auto addEdges = [&](const TopoDS_Shape& theF) {
+    for (TopExp_Explorer anExp(theF, TopAbs_EDGE); anExp.More(); anExp.Next())
+    {
+      const TopoDS_Edge& aE = TopoDS::Edge(anExp.Current());
+      if (isUsable(aE, TopoDS::Face(theF)))
+      {
+        anEdgeOri.Bind(aE, aE.Orientation());
+      }
+    }
+  };
+  for (itLF.Initialize(aFixed); itLF.More(); itLF.Next())
+  {
+    addEdges(itLF.Value());
+  }
+
+  NCollection_List<TopoDS_Shape> anOriented;
+  while (!aToOrient.IsEmpty())
+  {
+    bool bProgress = false;
+    for (itLF.Initialize(aToOrient); itLF.More();)
+    {
+      TopoDS_Shape    aF = itLF.Value();
+      TopExp_Explorer anExp(aF, TopAbs_EDGE);
+      for (; anExp.More(); anExp.Next())
+      {
+        const TopoDS_Edge& aE = TopoDS::Edge(anExp.Current());
+        if (isUsable(aE, TopoDS::Face(aF)) && anEdgeOri.IsBound(aE))
+        {
+          break;
+        }
+      }
+      if (!anExp.More())
+      {
+        itLF.Next();
+        continue;
+      }
+      // In a closed shell the two faces of an edge use it in opposite orientations
+      if (anExp.Current().Orientation() == anEdgeOri.Find(anExp.Current()))
+      {
+        aF.Reverse();
+      }
+      addEdges(aF);
+      anOriented.Append(aF);
+      aToOrient.Remove(itLF);
+      bProgress = true;
+    }
+    if (!bProgress)
+    {
+      // The rest is not connected to the shell. Images apart from the shell bound no part
+      // of the solid (e.g. a sliver cell between the extended faces); the general
+      // reconstruction discards them too.
+      for (itLF.Initialize(aToOrient); itLF.More(); itLF.Next())
+      {
+        if (!anImagesRes.Contains(itLF.Value()))
+        {
+          return TopoDS_Shape();
+        }
+      }
+      break;
+    }
+  }
+
+  // Make the shell and check that it is closed, manifold and consistently oriented
+  BRep_Builder aBB;
+  TopoDS_Shell aShell;
+  aBB.MakeShell(aShell);
+  for (int iL = 0; iL < 2; ++iL)
+  {
+    for (itLF.Initialize(iL == 0 ? aFixed : anOriented); itLF.More(); itLF.Next())
+    {
+      aBB.Add(aShell, itLF.Value());
+    }
+  }
+
+  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>
+    anEFMap;
+  TopExp::MapShapesAndUniqueAncestors(aShell, TopAbs_EDGE, TopAbs_FACE, anEFMap);
+  const int aNbE = anEFMap.Extent();
+  for (int i = 1; i <= aNbE; ++i)
+  {
+    const TopoDS_Edge&                    aE   = TopoDS::Edge(anEFMap.FindKey(i));
+    const NCollection_List<TopoDS_Shape>& aLEF = anEFMap(i);
+    const bool                            bSingle =
+      aLEF.Extent() == 1
+      && (BRep_Tool::Degenerated(aE) || BRep_Tool::IsClosed(aE, TopoDS::Face(aLEF.First())));
+    if (aLEF.Extent() != 2 && !bSingle)
+    {
+      return TopoDS_Shape();
+    }
+  }
+
+  aShell.Closed(true);
+  BRepCheck_Shell aCheck(aShell);
+  if (aCheck.Closed() != BRepCheck_NoError || aCheck.Orientation() != BRepCheck_NoError)
+  {
+    return TopoDS_Shape();
+  }
+
+  TopoDS_Solid aSolid;
+  aBB.MakeSolid(aSolid);
+  aBB.Add(aSolid, aShell);
+  return aSolid;
 }
