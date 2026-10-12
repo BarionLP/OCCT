@@ -195,6 +195,18 @@ public: //! @name Setting input data for the algorithm
   //! from the input shape.
   const NCollection_List<TopoDS_Shape>& FacesToRemove() const { return myFacesToRemove; }
 
+public: //! @name Options
+  //! Defines whether the features whose adjacent faces meet each other at grazing angles
+  //! inside the gap are skipped without trying to fill the gap: the extensions of such faces
+  //! nearly coincide, their intersection cannot split the gap between them and may take very
+  //! long. A skipped feature is reported with the warnings BOPAlgo_AlertGrazingAdjacentFaces
+  //! (with the faces meeting that way) and BOPAlgo_AlertUnableToRemoveTheFeature.
+  //! False by default.
+  void SetToSkipGrazingFeatures(const bool theFlag) { mySkipGrazingFeatures = theFlag; }
+
+  //! Returns whether the features with grazing adjacent faces are skipped
+  bool IsToSkipGrazingFeatures() const { return mySkipGrazingFeatures; }
+
 public: //! @name Performing the operation
   //! Performs the operation
   Standard_EXPORT void Perform(
@@ -272,6 +284,7 @@ protected: //! @name Fields
   // Inputs
   TopoDS_Shape                   myInputShape;    //!< Input shape
   NCollection_List<TopoDS_Shape> myFacesToRemove; //!< Faces to remove
+  bool mySkipGrazingFeatures = false; //!< Skip the features with grazing adjacent faces
 
   // Intermediate
   NCollection_List<TopoDS_Shape> myFeatures; //!< List of not connected features to remove

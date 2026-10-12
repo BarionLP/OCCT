@@ -54,8 +54,10 @@ public: //! @name Constructors
       : myRunParallel(false),
         myFuzzyValue(0.0),
         myIsLocalExtension(false),
+        mySkipGrazing(false),
         myFeatureSize(0.0),
         myHasAdjacentFaces(false),
+        myIsGrazing(false),
         myTrimDegenerated(false),
         myTrimFailed(false),
         myIsExtensionExhausted(false),
@@ -99,6 +101,10 @@ public: //! @name Setters/Getters
   //! Defines whether each adjacent face is extended by the size of the feature faces
   //! it borders instead of the size of the whole feature
   void SetLocalExtension(const bool theIsLocal) { myIsLocalExtension = theIsLocal; }
+
+  //! Defines whether the gap is left unfilled when the adjacent faces meet each other at
+  //! grazing angles inside it (see FindGrazingPairs)
+  void SetToSkipGrazing(const bool theFlag) { mySkipGrazing = theFlag; }
 
   //! Gets the History object
   const occ::handle<BRepTools_History>& History() { return myHistory; }
@@ -147,6 +153,21 @@ public: //! @name Perform the operation
       Bnd_Box aFeatureBox;
       BRepBndLib::Add(myFeature, aFeatureBox);
       myFeatureSize = std::max(sqrt(aFeatureBox.SquareExtent()), Precision::Confusion());
+
+      // The extensions of the adjacent faces meeting each other at grazing angles inside the
+      // gap cannot split it between them: leave the gap unfilled if requested
+      if (mySkipGrazing)
+      {
+        if (myGroups.IsEmpty())
+        {
+          GroupCoincidentFaces(aMFAdjacent);
+        }
+        if (FindGrazingPairs(aMFAdjacent, THE_NB_GRAZING_PAIRS) >= THE_NB_GRAZING_PAIRS)
+        {
+          myIsGrazing = true;
+          return;
+        }
+      }
 
       // The distance at which the adjacent surfaces meet is not related to the size of
       // the feature - for faces meeting at a small angle it grows without bound - so the
@@ -310,6 +331,12 @@ public: //! @name Obtain the result
 
   //! Shows whether the adjacent faces have been found for the feature
   bool HasAdjacentFaces() const { return myHasAdjacentFaces; }
+
+  //! Shows whether the gap has been left unfilled for the grazing adjacent faces
+  bool IsGrazing() const { return myIsGrazing; }
+
+  //! Returns the adjacent faces meeting each other at grazing angles
+  const NCollection_List<TopoDS_Shape>& GrazingFaces() const { return myGrazingFaces; }
 
   //! Returns the Images map of the adjacent faces
   const NCollection_IndexedDataMap<TopoDS_Shape,
@@ -1058,6 +1085,312 @@ private: //! @name Private methods performing the operation
     gp_Dir aDN1, aDN2;
     return NormalToFaceOnEdge(theE, theF1, aP1, aDN1) && NormalToFaceOnEdge(theE, theF2, aP2, aDN2)
            && aDN1.Angle(aDN2) < THE_TANGENT_ANGLE;
+  }
+
+  //! A point of an adjacent face on its edge shared with the feature
+  struct GrazingSample
+  {
+    gp_Pnt Point;
+    gp_Dir Normal; //!< normal to the face there, taking its orientation into account
+  };
+
+  //! Counts the pairs of adjacent faces meeting each other at grazing angles inside the gap
+  //! and collects their faces into myGrazingFaces. The faces of such a pair lie on different
+  //! surfaces and share no edge (the boundary between the faces sharing an edge cut by the
+  //! feature is recovered from that edge), but one of them runs alongside the surface of the
+  //! other along its edges shared with the feature: at least THE_GRAZING_SHARE of the points
+  //! sampled there lie closer to the surface of the other face, extended by the size of the
+  //! feature, than THE_GRAZING_DISTANCE of the size of the feature, with the normals deviating
+  //! by less than THE_GRAZING_ANGLE. The extensions of such faces nearly coincide inside the
+  //! gap, so their intersection cannot split the gap between them, and it may take very long.
+  //! The search stops at theMaxPairs pairs.
+  int FindGrazingPairs(
+    const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theMFAdjacent,
+    const int                                                            theMaxPairs)
+  {
+    myGrazingFaces.Clear();
+    const int aNbFA = theMFAdjacent.Extent();
+    if (aNbFA < 2)
+    {
+      return 0;
+    }
+
+    // The group of coincident faces of each face: the faces of a group are rebuilt as one
+    NCollection_DataMap<TopoDS_Shape, int, TopTools_ShapeMapHasher> aGroupOfFace;
+    for (int i = 1; i <= myGroups.Extent(); ++i)
+    {
+      NCollection_List<TopoDS_Shape>::Iterator itM(myGroups(i));
+      for (; itM.More(); itM.Next())
+      {
+        aGroupOfFace.Bind(itM.Value(), i);
+      }
+    }
+
+    // The samples on the feature edges of each face
+    NCollection_Array1<NCollection_List<GrazingSample>> aSamples(1, aNbFA);
+    for (int i = 1; i <= aNbFA; ++i)
+    {
+      SampleFeatureEdges(TopoDS::Face(theMFAdjacent(i)), aSamples(i));
+    }
+
+    // The faces sharing an edge
+    NCollection_Map<int> aSharing;
+    for (int i = 1; i <= aNbFA; ++i)
+    {
+      TopExp_Explorer anExpE(theMFAdjacent(i), TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        const NCollection_List<TopoDS_Shape>* pLF = myEFMap->Seek(anExpE.Current());
+        if (!pLF)
+        {
+          continue;
+        }
+        NCollection_List<TopoDS_Shape>::Iterator itLF(*pLF);
+        for (; itLF.More(); itLF.Next())
+        {
+          const int j = theMFAdjacent.FindIndex(itLF.Value());
+          if (j > 0 && j != i)
+          {
+            aSharing.Add(PairKey(i, j, aNbFA));
+          }
+        }
+      }
+    }
+
+    // The extended surfaces of the faces with the projectors on them, made when needed
+    NCollection_Array1<occ::handle<Geom_Surface>>                aSurfaces(1, aNbFA);
+    std::vector<std::unique_ptr<GeomAPI_ProjectPointOnSurf>> aProjectors(aNbFA + 1);
+    const auto aProjector = [&](const int theJ) -> GeomAPI_ProjectPointOnSurf& {
+      if (!aProjectors[theJ])
+      {
+        aSurfaces(theJ) = ExtendedSurface(TopoDS::Face(theMFAdjacent(theJ)), myFeatureSize);
+        double aU1, aU2, aV1, aV2;
+        aSurfaces(theJ)->Bounds(aU1, aU2, aV1, aV2);
+        aProjectors[theJ] = std::make_unique<GeomAPI_ProjectPointOnSurf>();
+        aProjectors[theJ]->Init(aSurfaces(theJ), aU1, aU2, aV1, aV2);
+      }
+      return *aProjectors[theJ];
+    };
+
+    // The share of the samples of the face i lying close to the surface of the face j and
+    // nearly parallel to it, and the least distance of such samples
+    const double aMaxDist  = THE_GRAZING_DISTANCE * myFeatureSize;
+    const double aCosMax   = cos(THE_GRAZING_ANGLE);
+    const double aCosPrune = cos(THE_GRAZING_PRUNE_ANGLE);
+    const auto   aShareAlongside = [&](const int theI, const int theJ, double& theMinDist) {
+      const TopoDS_Face&          aFj   = TopoDS::Face(theMFAdjacent(theJ));
+      GeomAPI_ProjectPointOnSurf& aProj = aProjector(theJ);
+      int                         aNbProjected = 0, aNbClose = 0;
+      NCollection_List<GrazingSample>::Iterator itS(aSamples(theI));
+      for (; itS.More(); itS.Next())
+      {
+        const GrazingSample& aSmp = itS.Value();
+        try
+        {
+          OCC_CATCH_SIGNALS
+          aProj.Perform(aSmp.Point);
+          if (!aProj.IsDone() || aProj.NbPoints() == 0)
+          {
+            continue;
+          }
+          ++aNbProjected;
+          const double aDist = aProj.LowerDistance();
+          if (aDist >= aMaxDist)
+          {
+            continue;
+          }
+          double aU, aV;
+          aProj.LowerDistanceParameters(aU, aV);
+          GeomLProp_SLProps aProps(aSurfaces(theJ), aU, aV, 1, Precision::Confusion());
+          if (!aProps.IsNormalDefined())
+          {
+            continue;
+          }
+          gp_Dir aN = aProps.Normal();
+          if (aFj.Orientation() == TopAbs_REVERSED)
+          {
+            aN.Reverse();
+          }
+          if (aSmp.Normal.Dot(aN) > aCosMax)
+          {
+            ++aNbClose;
+            theMinDist = std::min(theMinDist, aDist);
+          }
+        }
+        catch (Standard_Failure const&)
+        {
+        }
+      }
+      return aNbProjected ? static_cast<double>(aNbClose) / aNbProjected : 0.0;
+    };
+
+    // The pairs: the faces lying on one surface (coincident within the distance at all the
+    // samples) are left out, the algorithm rebuilds them as such
+    int                                                    aNbPairs = 0;
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMFGrazing;
+    for (int i = 1; i <= aNbFA; ++i)
+    {
+      for (int j = i + 1; j <= aNbFA; ++j)
+      {
+        if (aSamples(i).IsEmpty() || aSamples(j).IsEmpty()
+            || aSharing.Contains(PairKey(i, j, aNbFA)))
+        {
+          continue;
+        }
+        const int* pGi = aGroupOfFace.Seek(theMFAdjacent(i));
+        const int* pGj = aGroupOfFace.Seek(theMFAdjacent(j));
+        if (pGi && pGj && *pGi == *pGj)
+        {
+          continue;
+        }
+        // The faces nowhere near parallel to each other along their feature edges
+        bool isParallel = false;
+        NCollection_List<GrazingSample>::Iterator itSi(aSamples(i));
+        for (; itSi.More() && !isParallel; itSi.Next())
+        {
+          NCollection_List<GrazingSample>::Iterator itSj(aSamples(j));
+          for (; itSj.More() && !isParallel; itSj.Next())
+          {
+            isParallel = itSi.Value().Normal.Dot(itSj.Value().Normal) > aCosPrune;
+          }
+        }
+        if (!isParallel)
+        {
+          continue;
+        }
+
+        double       aDistMin  = Precision::Infinite();
+        const double aShareMax = std::max(aShareAlongside(i, j, aDistMin),
+                                          aShareAlongside(j, i, aDistMin));
+        if (aShareMax < THE_GRAZING_SHARE
+            || (aShareMax > 1.0 - Precision::Confusion() && aDistMin < Precision::Confusion()))
+        {
+          continue;
+        }
+        ++aNbPairs;
+        for (const int k : {i, j})
+        {
+          if (aMFGrazing.Add(theMFAdjacent(k)))
+          {
+            myGrazingFaces.Append(theMFAdjacent(k));
+          }
+        }
+        if (aNbPairs >= theMaxPairs)
+        {
+          return aNbPairs;
+        }
+      }
+    }
+    return aNbPairs;
+  }
+
+  //! Returns the key of the unordered pair of indices
+  static int PairKey(const int theI, const int theJ, const int theNb)
+  {
+    return std::min(theI, theJ) * (theNb + 1) + std::max(theI, theJ);
+  }
+
+  //! Samples the face along its edges shared with the feature
+  void SampleFeatureEdges(const TopoDS_Face& theF, NCollection_List<GrazingSample>& theSamples) const
+  {
+    const occ::handle<Geom_Surface>& aS = BRep_Tool::Surface(theF);
+    NCollection_List<TopoDS_Shape>   aLE;
+    TopExp_Explorer                  anExpE(theF, TopAbs_EDGE);
+    for (; anExpE.More(); anExpE.Next())
+    {
+      const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+      if (myFeatureEdgesMap.Contains(aE) && !BRep_Tool::Degenerated(aE))
+      {
+        aLE.Append(aE);
+      }
+    }
+    if (aLE.IsEmpty())
+    {
+      return;
+    }
+    // At most THE_NB_GRAZING_SAMPLES points on the face, at least one on each edge
+    const int aNbPerEdge =
+      std::max(1, std::min(THE_NB_GRAZING_EDGE_SAMPLES, THE_NB_GRAZING_SAMPLES / aLE.Extent()));
+    NCollection_List<TopoDS_Shape>::Iterator itE(aLE);
+    for (; itE.More(); itE.Next())
+    {
+      const TopoDS_Edge&               aE = TopoDS::Edge(itE.Value());
+      double                           aT1, aT2;
+      const occ::handle<Geom2d_Curve>& aC2D = BRep_Tool::CurveOnSurface(aE, theF, aT1, aT2);
+      if (aC2D.IsNull())
+      {
+        continue;
+      }
+      for (int k = 1; k <= aNbPerEdge; ++k)
+      {
+        const gp_Pnt2d    aUV = aC2D->Value(aT1 + (aT2 - aT1) * k / (aNbPerEdge + 1));
+        GeomLProp_SLProps aProps(aS, aUV.X(), aUV.Y(), 1, Precision::Confusion());
+        if (!aProps.IsNormalDefined())
+        {
+          continue;
+        }
+        gp_Dir aN = aProps.Normal();
+        if (theF.Orientation() == TopAbs_REVERSED)
+        {
+          aN.Reverse();
+        }
+        theSamples.Append({aProps.Value(), aN});
+      }
+    }
+  }
+
+  //! Returns the surface of the face to measure the distances to beyond the face: a bounded
+  //! surface extended by the given length, an unbounded one as it is
+  static occ::handle<Geom_Surface> ExtendedSurface(const TopoDS_Face& theF, const double theLength)
+  {
+    occ::handle<Geom_Surface> aS = BRep_Tool::Surface(theF);
+    while (const occ::handle<Geom_RectangularTrimmedSurface> aTS =
+             occ::down_cast<Geom_RectangularTrimmedSurface>(aS))
+    {
+      aS = aTS->BasisSurface();
+    }
+    double aU1, aU2, aV1, aV2;
+    BRepTools::UVBounds(theF, aU1, aU2, aV1, aV2);
+    if (aS->IsKind(STANDARD_TYPE(Geom_BSplineSurface))
+        || aS->IsKind(STANDARD_TYPE(Geom_BezierSurface)))
+    {
+      try
+      {
+        OCC_CATCH_SIGNALS
+        occ::handle<Geom_BoundedSurface> aBS =
+          new Geom_RectangularTrimmedSurface(aS, aU1, aU2, aV1, aV2);
+        for (const bool isU : {true, false})
+        {
+          for (const bool isAfter : {true, false})
+          {
+            GeomLib::ExtendSurfByLength(aBS, theLength, 1, isU, isAfter);
+          }
+        }
+        return aBS;
+      }
+      catch (Standard_Failure const&)
+      {
+        return aS;
+      }
+    }
+    // The swept surfaces may be infinite in the direction of the sweep, bound them to keep
+    // the projection on them local
+    if (aS->IsKind(STANDARD_TYPE(Geom_SweptSurface)))
+    {
+      double aSU1, aSU2, aSV1, aSV2;
+      aS->Bounds(aSU1, aSU2, aSV1, aSV2);
+      if (Precision::IsInfinite(aSU1) || Precision::IsInfinite(aSU2)
+          || Precision::IsInfinite(aSV1) || Precision::IsInfinite(aSV2))
+      {
+        return new Geom_RectangularTrimmedSurface(
+          aS,
+          Precision::IsInfinite(aSU1) ? aU1 - theLength : aSU1,
+          Precision::IsInfinite(aSU2) ? aU2 + theLength : aSU2,
+          Precision::IsInfinite(aSV1) ? aV1 - theLength : aSV1,
+          Precision::IsInfinite(aSV2) ? aV2 + theLength : aSV2);
+      }
+    }
+    return aS;
   }
 
   //! Recovers the boundaries between the tangent adjacent faces inside the gap from the
@@ -1895,6 +2228,7 @@ private: //! @name Fields
   bool myRunParallel;                     //!< Defines the mode of processing of the single feature
   double myFuzzyValue;                    //!< Fuzzy value for the intersections
   bool myIsLocalExtension;                //!< Extend each face by the size of the feature faces it borders
+  bool mySkipGrazing;                     //!< Leave the gap unfilled when the adjacent faces graze each other
   TopoDS_Shape myFeature;                             //!< Feature to remove
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myEFMap; //!< EF Connection map to find adjacent faces
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myFSMap; //!< FS Connection map to find solids participating in the feature removal
@@ -1909,6 +2243,8 @@ private: //! @name Fields
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myTrimEdges; //!< Recovered boundaries between tangent faces, by extended face
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myGroups; //!< Groups of adjacent faces lying on the same surface, by their first face
   bool myHasAdjacentFaces;                //!< Flag to show whether the adjacent faces have been found or not
+  bool myIsGrazing;                       //!< Flag to show that the gap has been left unfilled for the grazing adjacent faces
+  NCollection_List<TopoDS_Shape> myGrazingFaces; //!< Adjacent faces meeting each other at grazing angles
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myFaces;  //!< Reconstructed adjacent faces
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myAnchoredFaces; //!< Reconstructed faces validated by an edge of the original face
@@ -1952,6 +2288,26 @@ private: //! @name Fields
 
   //! Number of points of a recovered boundary checked against the tangent face
   static constexpr int THE_NB_DISTANCE_SAMPLES = 10;
+
+  //! Greatest distance of the grazing faces, relative to the size of the feature
+  static constexpr double THE_GRAZING_DISTANCE = 1.e-3;
+
+  //! Greatest angle between the normals of the grazing faces
+  static constexpr double THE_GRAZING_ANGLE = 10. * M_PI / 180.;
+
+  //! Least share of the samples of a face running alongside the other face
+  static constexpr double THE_GRAZING_SHARE = 0.5;
+
+  //! Least number of the pairs of grazing faces to leave the gap unfilled: a single pair
+  //! occurs around the features removed successfully
+  static constexpr int THE_NB_GRAZING_PAIRS = 2;
+
+  //! Number of points sampled on a feature edge of an adjacent face, and on all of them
+  static constexpr int THE_NB_GRAZING_EDGE_SAMPLES = 5;
+  static constexpr int THE_NB_GRAZING_SAMPLES      = 40;
+
+  //! The faces whose samples differ in the normal by more than this angle are not compared
+  static constexpr double THE_GRAZING_PRUNE_ANGLE = 45. * M_PI / 180.;
 };
 
 typedef NCollection_DynamicArray<FillGap> VectorOfFillGap;

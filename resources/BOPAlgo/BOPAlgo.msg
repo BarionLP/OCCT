@@ -86,6 +86,9 @@ Unable to remove the feature
 .BOPAlgo_AlertUnableToRebuildAdjacentFace
 Unable to rebuild the face adjacent to the feature
 
+.BOPAlgo_AlertGrazingAdjacentFaces
+The faces adjacent to the feature meet each other at grazing angles inside the gap
+
 .BOPAlgo_AlertNoFacesToRemove
 No faces have been found for removal
 

@@ -47,9 +47,14 @@
 
 #include <ElCLib.hxx>
 
+#include <Geom_BezierSurface.hxx>
+#include <Geom_BSplineSurface.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_RectangularTrimmedSurface.hxx>
 #include <Geom_Surface.hxx>
+#include <Geom_SweptSurface.hxx>
+#include <GeomLib.hxx>
+#include <GeomLProp_SLProps.hxx>
 #include <Geom2d_Curve.hxx>
 #include <Geom2d_Line.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
@@ -84,6 +89,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <vector>
 
 //=======================================================================
 // static methods declaration
@@ -454,6 +461,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     aFG.SetFSConnectionMap(anFSMap);
     aFG.SetRunParallel(myRunParallel);
     aFG.SetFuzzyValue(myFuzzyValue);
+    aFG.SetToSkipGrazing(mySkipGrazingFeatures);
   }
 
   const int             aNbF = aVFG.Length();
@@ -490,6 +498,22 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       return;
     }
     FillGap& aFG = aVFG(i);
+
+    // The feature skipped for its grazing adjacent faces
+    if (aFG.IsGrazing())
+    {
+      TopoDS_Compound aCGrazing;
+      BRep_Builder().MakeCompound(aCGrazing);
+      NCollection_List<TopoDS_Shape>::Iterator itG(aFG.GrazingFaces());
+      for (; itG.More(); itG.Next())
+      {
+        BRep_Builder().Add(aCGrazing, itG.Value());
+      }
+      AddWarning(new BOPAlgo_AlertGrazingAdjacentFaces(aCGrazing));
+      AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(aFG.Feature()));
+      aPSLoop.Next();
+      continue;
+    }
 
     // No need to fill the history for solids if the history is not
     // requested and the current feature is the last one.

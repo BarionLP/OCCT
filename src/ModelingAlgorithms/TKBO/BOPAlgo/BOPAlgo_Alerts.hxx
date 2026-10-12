@@ -103,6 +103,10 @@ DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertUnableToRemoveTheFeature)
 //! Unable to rebuild the face adjacent to the feature
 DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertUnableToRebuildAdjacentFace)
 
+//! The faces adjacent to the feature meet each other at grazing angles inside the gap,
+//! the feature has not been removed
+DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertGrazingAdjacentFaces)
+
 //! The Feature Removal algorithm has failed
 DEFINE_SIMPLE_ALERT(BOPAlgo_AlertRemoveFeaturesFailed)
 

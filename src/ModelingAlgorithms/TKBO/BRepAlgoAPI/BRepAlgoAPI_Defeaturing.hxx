@@ -106,7 +106,8 @@ public:
 public: //! @name Constructors
   //! Empty constructor
   BRepAlgoAPI_Defeaturing()
-      : myFillHistory(true)
+      : myFillHistory(true),
+        mySkipGrazingFeatures(false)
   {
   }
 
@@ -135,6 +136,15 @@ public: //! @name Setting input data for the algorithm
   //! Returns the list of faces which have been requested for removal
   //! from the input shape.
   const NCollection_List<TopoDS_Shape>& FacesToRemove() const { return myFacesToRemove; }
+
+public: //! @name Options
+  //! Defines whether the features whose adjacent faces meet each other at grazing angles
+  //! inside the gap are skipped without trying to fill the gap
+  //! (see BOPAlgo_RemoveFeatures::SetToSkipGrazingFeatures). False by default.
+  void SetToSkipGrazingFeatures(const bool theFlag) { mySkipGrazingFeatures = theFlag; }
+
+  //! Returns whether the features with grazing adjacent faces are skipped
+  bool IsToSkipGrazingFeatures() const { return mySkipGrazingFeatures; }
 
 public: //! @name Performing the operation
   //! Performs the operation
@@ -184,6 +194,7 @@ protected:                                        //! @name Fields
   NCollection_List<TopoDS_Shape> myFacesToRemove; //!< Features to remove from the shape
   bool                           myFillHistory;   //!< Defines whether to track the history of
                                                   //! shapes modifications or not (true by default)
+  bool mySkipGrazingFeatures;                     //!< Skip the features with grazing adjacent faces
   BOPAlgo_RemoveFeatures myFeatureRemovalTool;    //!< Tool for the features removal
 };
 
