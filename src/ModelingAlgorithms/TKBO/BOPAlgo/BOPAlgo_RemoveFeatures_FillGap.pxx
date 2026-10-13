@@ -70,7 +70,8 @@ public: //! @name Constructors
         myTrimDegenerated(false),
         myTrimFailed(false),
         myIsExtensionExhausted(false),
-        myNbDegenerated(0)
+        myNbDegenerated(0),
+        myOrigins(nullptr)
   {
   }
 
@@ -114,6 +115,14 @@ public: //! @name Setters/Getters
   //! Defines whether the gap is left unfilled when the adjacent faces meet each other at
   //! grazing angles inside it (see FindGrazingPairs)
   void SetToSkipGrazing(const bool theFlag) { mySkipGrazing = theFlag; }
+
+  //! Sets the faces of the input shape the faces rebuilt by the removal of the previous
+  //! features have been made from
+  void SetOriginalFaces(
+    const NCollection_DataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>& theOrigins)
+  {
+    myOrigins = &theOrigins;
+  }
 
   //! Gets the History object
   const occ::handle<BRepTools_History>& History() { return myHistory; }
@@ -535,7 +544,12 @@ private: //! @name Private methods performing the operation
     {
       const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
       const TopoDS_Face&                    aFRep    = TopoDS::Face(myGroups.FindKey(i));
-      const TopoDS_Face                     aF       = MakeGroupFace(aMembers);
+      // The faces rebuilt by the removal of the previous features lie on the surfaces extended for
+      // those removals, they are put back on the surfaces of the input faces
+      const TopoDS_Shape* pOrigin = myOrigins ? myOrigins->Seek(aFRep) : nullptr;
+      const TopoDS_Face   aF      = pOrigin
+                                      ? OnOriginalSurface(MakeGroupFace(aMembers), TopoDS::Face(*pOrigin))
+                                      : MakeGroupFace(aMembers);
 
       // Extend the face only in the parametric directions the feature lies in, to keep
       // the extended faces from interfering with each other away from the feature
@@ -762,6 +776,57 @@ private: //! @name Private methods performing the operation
       theDN.Reverse();
     }
     return true;
+  }
+
+  //! Rebuilds the face on the surface of the input face it has been made from. A rebuilt face
+  //! lies on the surface extended for the removal of a previous feature (see ExtendFace), which
+  //! coincides with the original one over its domain, but has more spans and a raised degree;
+  //! extended again for the next feature, it grows with every feature, and its intersections
+  //! with the faces it touches tangentially (blends) become very slow. The free-form faces lying
+  //! within the domain of the original surface are put back on it, the others are kept.
+  static TopoDS_Face OnOriginalSurface(const TopoDS_Face& theF, const TopoDS_Face& theOrigin)
+  {
+    if (IsElementary(theF))
+    {
+      return theF;
+    }
+    const occ::handle<Geom_Surface> aS  = BRep_Tool::Surface(theF);
+    const occ::handle<Geom_Surface> aS0 = BRep_Tool::Surface(theOrigin);
+    if (aS.IsNull() || aS0.IsNull() || aS == aS0)
+    {
+      return theF;
+    }
+    double aU1, aU2, aV1, aV2, aSU1, aSU2, aSV1, aSV2;
+    BRepTools::UVBounds(theF, aU1, aU2, aV1, aV2);
+    aS0->Bounds(aSU1, aSU2, aSV1, aSV2);
+    const double anEps = Precision::PConfusion();
+    if (aU1 < aSU1 - anEps || aU2 > aSU2 + anEps || aV1 < aSV1 - anEps || aV2 > aSV2 + anEps)
+    {
+      return theF;
+    }
+    // The extension keeps the parametrization of the original surface
+    const double aTol = BRep_Tool::Tolerance(theF);
+    for (const double aU : {aU1, 0.5 * (aU1 + aU2), aU2})
+    {
+      for (const double aV : {aV1, 0.5 * (aV1 + aV2), aV2})
+      {
+        if (aS->Value(aU, aV).SquareDistance(aS0->Value(aU, aV)) > aTol * aTol)
+        {
+          return theF;
+        }
+      }
+    }
+    BRepLib_MakeFace aMF(aS0, aU1, aU2, aV1, aV2, aTol);
+    if (!aMF.IsDone())
+    {
+      return theF;
+    }
+    TopoDS_Face aFace = aMF.Face();
+    if (theF.Orientation() == TopAbs_REVERSED)
+    {
+      aFace.Reverse();
+    }
+    return aFace;
   }
 
   //! Builds the face covering all the faces of the group on the surface of its
@@ -2696,6 +2761,7 @@ private: //! @name Fields
   bool myTrimFailed;                      //!< Flag to show that the extended faces could not be intersected
   bool myIsExtensionExhausted;            //!< Flag to show that no adjacent face can be extended any further
   int myNbDegenerated;                    //!< Number of the extended faces whose trimming degenerated
+  const NCollection_DataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>* myOrigins; //!< Input faces of the rebuilt faces
   // clang-format on
 
   //! Least number of attempts to extend the adjacent faces, each one doubling the
@@ -2770,7 +2836,5 @@ private: //! @name Fields
   //! Step from an edge of a patched face to tell its sides, relative to its length
   static constexpr double THE_PATCH_STEP = 0.05;
 };
-
-typedef NCollection_DynamicArray<FillGap> VectorOfFillGap;
 
 #endif // _BOPAlgo_RemoveFeatures_FillGap_HeaderFile

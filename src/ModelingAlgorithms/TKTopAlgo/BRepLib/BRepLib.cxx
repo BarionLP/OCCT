@@ -3153,7 +3153,11 @@ void BRepLib::ExtendFace(const TopoDS_Face& theF,
     {
       // Adjust face bounds to first period
       double aDelta = aFUMax - aFUMin;
-      aFUMin = std::max(aSUMin, aFUMin + anUPeriod * std::ceil((aSUMin - aFUMin) / anUPeriod));
+      // (a bound below the first period by a rounding error is not shifted by a whole period)
+      aFUMin = std::max(aSUMin,
+                        aFUMin
+                          + anUPeriod
+                              * std::ceil((aSUMin - aFUMin) / anUPeriod - Precision::PConfusion()));
       aFUMax = aFUMin + aDelta;
     }
 
@@ -3163,7 +3167,10 @@ void BRepLib::ExtendFace(const TopoDS_Face& theF,
     {
       // Adjust face bounds to first period
       double aDelta = aFVMax - aFVMin;
-      aFVMin        = std::max(aSVMin, aFVMin + aVPeriod * std::ceil((aSVMin - aFVMin) / aVPeriod));
+      aFVMin        = std::max(aSVMin,
+                        aFVMin
+                          + aVPeriod
+                              * std::ceil((aSVMin - aFVMin) / aVPeriod - Precision::PConfusion()));
       aFVMax        = aFVMin + aDelta;
     }
 

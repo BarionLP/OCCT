@@ -24,7 +24,6 @@
 
 #include <BOPTools_AlgoTools.hxx>
 #include <BOPTools_AlgoTools2D.hxx>
-#include <BOPTools_Parallel.hxx>
 #include <BOPTools_Set.hxx>
 
 #include <Bnd_Box.hxx>
@@ -435,6 +434,102 @@ void BOPAlgo_RemoveFeatures::PrepareFeatures(const Message_ProgressRange& theRan
 
 #include "BOPAlgo_RemoveFeatures_FillGap.pxx"
 
+//=================================================================================================
+
+//! Replaces the faces of the current shape by the faces of the input shape they have been made
+//! from by the removal of the previous features
+static TopoDS_Compound OriginalFaces(
+  const NCollection_List<TopoDS_Shape>&                                            theFaces,
+  const NCollection_DataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher>& theOrigins)
+{
+  TopoDS_Compound aCFaces;
+  BRep_Builder().MakeCompound(aCFaces);
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aFence;
+  NCollection_List<TopoDS_Shape>::Iterator               itLF(theFaces);
+  for (; itLF.More(); itLF.Next())
+  {
+    const TopoDS_Shape* pOrigin = theOrigins.Seek(itLF.Value());
+    const TopoDS_Shape& aF      = pOrigin ? *pOrigin : itLF.Value();
+    if (aFence.Add(aF))
+    {
+      BRep_Builder().Add(aCFaces, aF);
+    }
+  }
+  return aCFaces;
+}
+
+//=================================================================================================
+
+//! Adds the faces made from the faces of the input feature by the removal of the previous
+//! features (the faces themselves if they have not been modified)
+static void CurrentFaces(const TopoDS_Shape&                                            theFeature,
+                         const occ::handle<BRepTools_History>&                          theHistory,
+                         NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theFaces)
+{
+  for (TopoDS_Iterator itF(theFeature); itF.More(); itF.Next())
+  {
+    const NCollection_List<TopoDS_Shape>& aLFIm = theHistory->Modified(itF.Value());
+    if (aLFIm.IsEmpty())
+    {
+      theFaces.Add(itF.Value());
+      continue;
+    }
+    for (NCollection_List<TopoDS_Shape>::Iterator itLFIm(aLFIm); itLFIm.More(); itLFIm.Next())
+    {
+      theFaces.Add(itLFIm.Value());
+    }
+  }
+}
+
+//=================================================================================================
+
+//! Merges the faces and edges split by the removal of a feature, so that the next features find
+//! whole adjacent faces. The sub-shapes of the shape the feature has been removed from are kept,
+//! and so are the edges of the faces of the features still to be removed: merged with other
+//! faces, they would take them away with the feature.
+static TopoDS_Shape UnifyRemoval(
+  const TopoDS_Shape&                                                  theShape,
+  const TopoDS_Shape&                                                  thePrevShape,
+  const NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theKeptFaces,
+  const occ::handle<BRepTools_History>&                                theHistory)
+{
+  ShapeUpgrade_UnifySameDomain aSDTool;
+  aSDTool.Initialize(theShape, true, true);
+  aSDTool.AllowInternalEdges(false);
+  NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aMS, aMPrev;
+  TopExp::MapShapes(theShape, aMS);
+  TopExp::MapShapes(thePrevShape, aMPrev);
+  for (int i = 1; i <= aMPrev.Extent(); ++i)
+  {
+    if (aMS.Contains(aMPrev(i)))
+    {
+      aSDTool.KeepShape(aMPrev(i));
+    }
+  }
+  for (int i = 1; i <= theKeptFaces.Extent(); ++i)
+  {
+    for (TopExp_Explorer anExpE(theKeptFaces(i), TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      if (aMS.Contains(anExpE.Current()))
+      {
+        aSDTool.KeepShape(anExpE.Current());
+      }
+    }
+  }
+  try
+  {
+    OCC_CATCH_SIGNALS
+    aSDTool.Build();
+  }
+  catch (Standard_Failure const&)
+  {
+    // The faces stay split, which only costs the next features some time
+    return theShape;
+  }
+  theHistory->Merge(aSDTool.History());
+  return aSDTool.Shape();
+}
+
 //=======================================================================
 // function: RemoveFeatures
 // purpose: Remove features by filling the gaps by extension of the
@@ -448,108 +543,143 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
   // - Trim the extended faces to fill the gap;
   // - Rebuild the solids with reconstructed adjacent faces
   //   and avoiding the feature faces.
+  //
+  // The gap of each feature is filled in the shape the previous features have been removed
+  // from. Features often share adjacent faces (holes in one wall), and the faces rebuilt from
+  // the input shape would bring back the gaps of the features removed before; the solids
+  // would then have to be rebuilt from all of their faces, overlapping the rebuilt face with
+  // its image from the previous removal, which is slow and does not always close the gaps
+  // the same way.
 
-  Message_ProgressScope aPSOuter(theRange, "Removing features", 2);
-
-  // Make Edge-Face connection map of the input
-  // shape to find faces adjacent to the feature
-  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>
-    anEFMap;
-  TopExp::MapShapesAndAncestors(myInputShape, TopAbs_EDGE, TopAbs_FACE, anEFMap);
-
-  // Make Face-Solid connection map to find the solids
-  // participating in the removal of each feature
-  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>
-    anFSMap;
-  TopExp::MapShapesAndAncestors(myInputShape, TopAbs_FACE, TopAbs_SOLID, anFSMap);
-
-  // Tool for reconstruction of the faces adjacent to the feature
-  // in parallel threads if necessary.
-  VectorOfFillGap aVFG;
-  // Fill the vector
-  NCollection_List<TopoDS_Shape>::Iterator itF(myFeatures);
-  for (; itF.More(); itF.Next())
-  {
-    const TopoDS_Shape& aFeature = itF.Value();
-    FillGap&            aFG      = aVFG.Appended();
-    aFG.SetFeature(aFeature);
-    aFG.SetEFConnectionMap(anEFMap);
-    aFG.SetFSConnectionMap(anFSMap);
-    aFG.SetRunParallel(myRunParallel);
-    aFG.SetFuzzyValue(myFuzzyValue);
-    aFG.SetToSkipGrazing(mySkipGrazingFeatures);
-  }
-
-  const int             aNbF = aVFG.Length();
-  Message_ProgressScope aPS(aPSOuter.Next(), "Filling gaps", aNbF);
-  for (int i = 0; i < aNbF; ++i)
-  {
-    FillGap& aFG = aVFG.ChangeValue(i);
-    aFG.SetRange(aPS.Next());
-  }
-  // Perform the reconstruction of the adjacent faces
-  BOPTools_Parallel::Perform(myRunParallel, aVFG);
-  if (UserBreak(aPSOuter))
-  {
-    return;
-  }
-  // Even if the history is not requested, it is necessary to track:
-  // - The solids modification after each feature removal to find
-  //   the necessary solids to rebuild on the next step.
-  // - The faces modification after each feature removal to find the
-  //   splits of the adjacent and feature faces for the next steps.
+  // Even if the history is not requested, it is necessary to track the faces
+  // modification after each feature removal to find the faces of the next
+  // features and to report the faces of the input shape.
   if (myHistory.IsNull())
   {
     myHistory = new BRepTools_History();
   }
 
+  // Edge-Face connection map of the current shape to find faces adjacent to the feature,
+  // and Face-Solid connection map to find the solids participating in its removal.
+  // Rebuilt after each removed feature.
+  NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>
+    anEFMap, anFSMap;
+  // The faces of the input shape the faces of the current shape have been made from
+  NCollection_DataMap<TopoDS_Shape, TopoDS_Shape, TopTools_ShapeMapHasher> anOrigins;
+  bool isMapsValid = false;
+
   // Remove the features one by one.
   // It will allow removing the features even if there were
   // some problems with removal of the previous features.
-  Message_ProgressScope aPSLoop(aPSOuter.Next(), "Removing features one by one", aNbF);
-  for (int i = 0; i < aNbF; ++i)
+  const int             aNbF = myFeatures.Extent();
+  Message_ProgressScope aPSLoop(theRange, "Removing features one by one", aNbF);
+  NCollection_List<TopoDS_Shape>::Iterator itF(myFeatures);
+  for (; itF.More(); itF.Next())
   {
     if (UserBreak(aPSLoop))
     {
       return;
     }
-    FillGap& aFG = aVFG(i);
+    const TopoDS_Shape&   anInputFeature = itF.Value();
+    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 4);
+
+    if (!isMapsValid)
+    {
+      anEFMap.Clear();
+      anFSMap.Clear();
+      TopExp::MapShapesAndAncestors(myShape, TopAbs_EDGE, TopAbs_FACE, anEFMap);
+      TopExp::MapShapesAndAncestors(myShape, TopAbs_FACE, TopAbs_SOLID, anFSMap);
+      anOrigins.Clear();
+      for (int i = 1; i <= myInputsMap.Extent(); ++i)
+      {
+        if (myInputsMap(i).ShapeType() != TopAbs_FACE)
+        {
+          continue;
+        }
+        NCollection_List<TopoDS_Shape>::Iterator itLIm(myHistory->Modified(myInputsMap(i)));
+        for (; itLIm.More(); itLIm.Next())
+        {
+          anOrigins.Bind(itLIm.Value(), myInputsMap(i));
+        }
+      }
+      isMapsValid = true;
+    }
+
+    // The faces of the feature in the current shape
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aFeatureFaces;
+    CurrentFaces(anInputFeature, myHistory, aFeatureFaces);
+    TopoDS_Compound aFeature;
+    BRep_Builder().MakeCompound(aFeature);
+    bool bHasFaces = false;
+    for (int i = 1; i <= aFeatureFaces.Extent(); ++i)
+    {
+      if (anFSMap.Contains(aFeatureFaces(i)))
+      {
+        BRep_Builder().Add(aFeature, aFeatureFaces(i));
+        bHasFaces = true;
+      }
+    }
+    if (!bHasFaces)
+    {
+      // Nothing is left of the feature
+      continue;
+    }
+
+    // After the removal, the faces split by it are merged for the next features (the last
+    // one leaves it to the simplification of the result), keeping the faces of the features
+    // still to be removed
+    const TopoDS_Shape aPrevShape = myShape;
+    const auto         aOnRemoved = [&]() {
+      isMapsValid = false;
+      NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aRemainingFaces;
+      NCollection_List<TopoDS_Shape>::Iterator                      itR(itF);
+      for (itR.Next(); itR.More(); itR.Next())
+      {
+        CurrentFaces(itR.Value(), myHistory, aRemainingFaces);
+      }
+      if (!aRemainingFaces.IsEmpty())
+      {
+        myShape = UnifyRemoval(myShape, aPrevShape, aRemainingFaces, myHistory);
+      }
+    };
+    FillGap aFG;
+    aFG.SetFeature(aFeature);
+    aFG.SetEFConnectionMap(anEFMap);
+    aFG.SetFSConnectionMap(anFSMap);
+    aFG.SetRunParallel(myRunParallel);
+    aFG.SetFuzzyValue(myFuzzyValue);
+    aFG.SetOriginalFaces(anOrigins);
+    aFG.SetToSkipGrazing(mySkipGrazingFeatures);
+    aFG.SetRange(aPSFeature.Next());
+    aFG.Perform();
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
 
     // A feature with grazing adjacent faces which could not be removed: skipped, or the
     // patch covering the gap next to them has not closed the solids
     const auto aReportGrazing = [&]() {
-      TopoDS_Compound aCGrazing;
-      BRep_Builder().MakeCompound(aCGrazing);
-      NCollection_List<TopoDS_Shape>::Iterator itG(aFG.GrazingFaces());
-      for (; itG.More(); itG.Next())
-      {
-        BRep_Builder().Add(aCGrazing, itG.Value());
-      }
-      AddWarning(new BOPAlgo_AlertGrazingAdjacentFaces(aCGrazing));
-      AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(aFG.Feature()));
+      AddWarning(new BOPAlgo_AlertGrazingAdjacentFaces(OriginalFaces(aFG.GrazingFaces(), anOrigins)));
+      AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(anInputFeature));
     };
     if (aFG.IsGrazing())
     {
       aReportGrazing();
-      aPSLoop.Next();
       continue;
     }
 
-    // No need to fill the history for solids if the history is not
-    // requested and the current feature is the last one.
-    bool isSolidsHistoryNeeded = HasHistory() || (i < (aNbF - 1));
-
     // Perform removal of the single feature
-    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 3);
     if (RemoveFeature(aFG.Solids(),
                       aFG.FeatureFacesMap(),
                       aFG.HasAdjacentFaces(),
                       aFG.Faces(),
                       aFG.AnchoredFaces(),
                       aFG.History(),
-                      isSolidsHistoryNeeded,
+                      HasHistory(),
                       aPSFeature.Next()))
     {
+      aOnRemoved();
       if (aFG.IsPatched())
       {
         // Checked in the final result, the simplification may merge its edges
@@ -576,11 +706,12 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     // interfere with each other away from the gap. Retry the feature with every face
     // extended by the size of the feature faces it borders.
     FillGap aFGLocal;
-    aFGLocal.SetFeature(aFG.Feature());
+    aFGLocal.SetFeature(aFeature);
     aFGLocal.SetEFConnectionMap(anEFMap);
     aFGLocal.SetFSConnectionMap(anFSMap);
     aFGLocal.SetRunParallel(myRunParallel);
     aFGLocal.SetFuzzyValue(myFuzzyValue);
+    aFGLocal.SetOriginalFaces(anOrigins);
     aFGLocal.SetLocalExtension(true);
     aFGLocal.SetRange(aPSFeature.Next());
     aFGLocal.Perform();
@@ -594,9 +725,10 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
                       aFGLocal.Faces(),
                       aFGLocal.AnchoredFaces(),
                       aFGLocal.History(),
-                      isSolidsHistoryNeeded,
+                      HasHistory(),
                       aPSFeature.Next()))
     {
+      aOnRemoved();
       continue;
     }
     if (UserBreak(aPSFeature))
@@ -605,11 +737,11 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     }
 
     // Report the failure with the faces the first reconstruction could not rebuild
-    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(aFG.Feature()));
-    NCollection_List<TopoDS_Shape>::Iterator itF(aFG.FacesNotRebuilt());
-    for (; itF.More(); itF.Next())
+    AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(anInputFeature));
+    const TopoDS_Compound aNotRebuilt = OriginalFaces(aFG.FacesNotRebuilt(), anOrigins);
+    for (TopoDS_Iterator itNR(aNotRebuilt); itNR.More(); itNR.Next())
     {
-      AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itF.Value()));
+      AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itNR.Value()));
     }
   }
 }
@@ -1102,8 +1234,17 @@ void BOPAlgo_RemoveFeatures::SimplifyResult(const Message_ProgressRange& theRang
     }
   }
 
-  // Perform unification
-  aSDTool.Build();
+  // Perform unification. The result is valid without it, and is kept as it is if the
+  // unification fails.
+  try
+  {
+    OCC_CATCH_SIGNALS
+    aSDTool.Build();
+  }
+  catch (Standard_Failure const&)
+  {
+    return;
+  }
   aPSOuter.Next();
   myShape = aSDTool.Shape();
   if (HasHistory())

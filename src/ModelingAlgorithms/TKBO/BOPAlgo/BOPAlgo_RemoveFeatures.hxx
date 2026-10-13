@@ -46,7 +46,8 @@
 //! Before reconstructing the shape, the algorithm will sort all
 //! the given faces on the connected blocks (features).
 //!
-//! The features will be removed from the shape one by one.
+//! The features will be removed from the shape one by one, each from the shape
+//! the previous features have been removed from.
 //! It will allow removing all possible features even if there
 //! were problems with the removal of some of them.
 //!
@@ -241,7 +242,7 @@ protected: //! @name Protected methods performing the removal
   Standard_EXPORT void PrepareFeatures(const Message_ProgressRange& theRange);
 
   //! Removes the features and fills the created gaps by extension of the adjacent faces.
-  //! Processes each feature separately.
+  //! Processes each feature separately, in the shape the previous features have been removed from.
   Standard_EXPORT void RemoveFeatures(const Message_ProgressRange& theRange);
 
   //! Remove the single feature from the shape.
