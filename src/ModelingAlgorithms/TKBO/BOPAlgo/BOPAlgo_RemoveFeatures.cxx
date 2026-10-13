@@ -32,8 +32,17 @@
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 
+#include <Adaptor3d_CurveOnSurface.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepClass_FaceClassifier.hxx>
+#include <GCPnts_AbscissaPoint.hxx>
+#include <Geom2dAdaptor_Curve.hxx>
+#include <GeomAdaptor_Surface.hxx>
+#include <GeomPlate_BuildPlateSurface.hxx>
+#include <GeomPlate_CurveConstraint.hxx>
+#include <GeomPlate_MakeApprox.hxx>
+#include <GeomPlate_Surface.hxx>
 
 #include <BRepBndLib.hxx>
 #include <BRepCheck_Shell.hxx>
@@ -269,6 +278,13 @@ void BOPAlgo_RemoveFeatures::Perform(const Message_ProgressRange& theRange)
     {
       return;
     }
+    // Check the patches filling the gaps
+    NCollection_List<TopoDS_Shape>::Iterator itP(myPatches);
+    NCollection_List<double>::Iterator       itS(myPatchSizes);
+    for (; itP.More() && itS.More(); itP.Next(), itS.Next())
+    {
+      CheckPatchTolerance(itP.Value(), itS.Value());
+    }
     // Post treatment
     PostTreat();
   }
@@ -499,9 +515,9 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     }
     FillGap& aFG = aVFG(i);
 
-    // The feature skipped for its grazing adjacent faces
-    if (aFG.IsGrazing())
-    {
+    // A feature with grazing adjacent faces which could not be removed: skipped, or the
+    // patch covering the gap next to them has not closed the solids
+    const auto aReportGrazing = [&]() {
       TopoDS_Compound aCGrazing;
       BRep_Builder().MakeCompound(aCGrazing);
       NCollection_List<TopoDS_Shape>::Iterator itG(aFG.GrazingFaces());
@@ -511,6 +527,10 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       }
       AddWarning(new BOPAlgo_AlertGrazingAdjacentFaces(aCGrazing));
       AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(aFG.Feature()));
+    };
+    if (aFG.IsGrazing())
+    {
+      aReportGrazing();
       aPSLoop.Next();
       continue;
     }
@@ -530,11 +550,23 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
                       isSolidsHistoryNeeded,
                       aPSFeature.Next()))
     {
+      if (aFG.IsPatched())
+      {
+        // Checked in the final result, the simplification may merge its edges
+        myPatches.Append(aFG.Patch());
+        myPatchSizes.Append(aFG.FeatureSize());
+      }
       continue;
     }
     if (UserBreak(aPSFeature))
     {
       return;
+    }
+    // The extension of the grazing faces, which the patch has replaced, is not tried
+    if (aFG.IsPatched())
+    {
+      aReportGrazing();
+      continue;
     }
 
     // The adjacent faces extended by the size of the whole feature have not closed the
@@ -579,6 +611,56 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     {
       AddWarning(new BOPAlgo_AlertUnableToRebuildAdjacentFace(itF.Value()));
     }
+  }
+}
+
+//=================================================================================================
+
+//! Greatest tolerance of the edges and vertices of a patch, relative to the size of the feature
+static constexpr double THE_PATCH_MAX_TOLERANCE = 1.e-3;
+
+void BOPAlgo_RemoveFeatures::CheckPatchTolerance(const TopoDS_Shape& thePatch,
+                                                 const double        theFeatureSize)
+{
+  if (!HasHistory())
+  {
+    // The pieces of the patch cannot be found in the simplified result
+    return;
+  }
+  // The pieces of the patch in the result: the corners where the patch meets two faces
+  // around it at small angles to each other may get far apart, and the vertices there take
+  // up the distance in their tolerance
+  const double   aMaxTol = THE_PATCH_MAX_TOLERANCE * theFeatureSize;
+  TopoDS_Compound aCExceeding;
+  BRep_Builder().MakeCompound(aCExceeding);
+  bool                                                   isExceeding = false;
+  NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMChecked;
+  // The history follows the patch itself, its pieces are its modifications
+  NCollection_List<TopoDS_Shape>::Iterator itF(myHistory->Modified(thePatch));
+  for (; itF.More(); itF.Next())
+  {
+    for (TopExp_Explorer anExp(itF.Value(), TopAbs_EDGE); anExp.More(); anExp.Next())
+    {
+      if (aMChecked.Add(anExp.Current())
+          && BRep_Tool::Tolerance(TopoDS::Edge(anExp.Current())) > aMaxTol)
+      {
+        BRep_Builder().Add(aCExceeding, anExp.Current());
+        isExceeding = true;
+      }
+    }
+    for (TopExp_Explorer anExp(itF.Value(), TopAbs_VERTEX); anExp.More(); anExp.Next())
+    {
+      if (aMChecked.Add(anExp.Current())
+          && BRep_Tool::Tolerance(TopoDS::Vertex(anExp.Current())) > aMaxTol)
+      {
+        BRep_Builder().Add(aCExceeding, anExp.Current());
+        isExceeding = true;
+      }
+    }
+  }
+  if (isExceeding)
+  {
+    AddWarning(new BOPAlgo_AlertPatchTolerance(aCExceeding));
   }
 }
 

@@ -107,6 +107,10 @@ DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertUnableToRebuildAdjacentFace)
 //! the feature has not been removed
 DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertGrazingAdjacentFaces)
 
+//! The patch filling the gap of the feature meets the faces around it only within a large
+//! tolerance (the edges and vertices exceeding it are given)
+DEFINE_ALERT_WITH_SHAPE(BOPAlgo_AlertPatchTolerance)
+
 //! The Feature Removal algorithm has failed
 DEFINE_SIMPLE_ALERT(BOPAlgo_AlertRemoveFeaturesFailed)
 

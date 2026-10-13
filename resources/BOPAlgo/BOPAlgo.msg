@@ -89,6 +89,9 @@ Unable to rebuild the face adjacent to the feature
 .BOPAlgo_AlertGrazingAdjacentFaces
 The faces adjacent to the feature meet each other at grazing angles inside the gap
 
+.BOPAlgo_AlertPatchTolerance
+The patch filling the gap of the feature meets the faces around it only within a large tolerance
+
 .BOPAlgo_AlertNoFacesToRemove
 No faces have been found for removal
 

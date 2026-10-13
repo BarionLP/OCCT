@@ -223,6 +223,8 @@ public: //! @name Clearing the contents of the algorithm
     myFacesToRemove.Clear();
     myFeatures.Clear();
     myInputsMap.Clear();
+    myPatches.Clear();
+    myPatchSizes.Clear();
   }
 
 protected: //! @name Protected methods performing the removal
@@ -266,6 +268,11 @@ protected: //! @name Protected methods performing the removal
     const bool                                                           theSolidsHistoryNeeded,
     const Message_ProgressRange&                                         theRange);
 
+  //! Warns when the patch filling the gap of a feature (the extended face its pieces are cut
+  //! from, followed through the history) meets the faces around it in the result only within
+  //! a tolerance greater than a part of the size of the feature. Needs the history.
+  Standard_EXPORT void CheckPatchTolerance(const TopoDS_Shape& thePatch, const double theFeatureSize);
+
   //! Updates history with the removed features
   Standard_EXPORT void UpdateHistory(const Message_ProgressRange& theRange);
 
@@ -291,6 +298,8 @@ protected: //! @name Fields
                                              //! (each feature is a compound of faces)
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>
     myInputsMap; //!< Map of all sub-shapes of the input shape
+  NCollection_List<TopoDS_Shape> myPatches;    //!< Patches filling the gaps
+  NCollection_List<double>       myPatchSizes; //!< Sizes of the features the patches replace
 };
 
 #endif // _BOPAlgo_RemoveFeatures_HeaderFile

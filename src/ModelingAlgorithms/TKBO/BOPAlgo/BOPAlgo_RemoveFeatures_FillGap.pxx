@@ -48,6 +48,15 @@ private: //! @name Auxiliary types
     bool          IsDone;    //!< the boundary has been recovered from this end
   };
 
+  //! An edge of a patched face with the feature: the patch passes through it, tangent to the face
+  struct PatchEdge
+  {
+    TopoDS_Edge Edge;  //!< the edge, oriented as in the face
+    TopoDS_Face Face;  //!< the patched face
+    gp_Pnt      Point; //!< the middle of the edge
+    gp_Vec      Into;  //!< a short step from the middle into the face (null if unknown)
+  };
+
 public: //! @name Constructors
   //! Empty constructor
   FillGap()
@@ -155,14 +164,21 @@ public: //! @name Perform the operation
       myFeatureSize = std::max(sqrt(aFeatureBox.SquareExtent()), Precision::Confusion());
 
       // The extensions of the adjacent faces meeting each other at grazing angles inside the
-      // gap cannot split it between them: leave the gap unfilled if requested
+      // gap cannot split it between them. If requested, such faces are not extended: their
+      // part of the gap is covered by a patch surface tangent to them along their edges with
+      // the feature, and the gap is left unfilled when the patch cannot be built.
       if (mySkipGrazing)
       {
         if (myGroups.IsEmpty())
         {
           GroupCoincidentFaces(aMFAdjacent);
         }
-        if (FindGrazingPairs(aMFAdjacent, THE_NB_GRAZING_PAIRS) >= THE_NB_GRAZING_PAIRS)
+        // The patch needs all the grazing faces, the features with many adjacent faces are only
+        // checked (looking for all the pairs among them takes long)
+        const bool isPatchable = aMFAdjacent.Extent() <= THE_PATCH_MAX_FACES;
+        if (FindGrazingPairs(aMFAdjacent, isPatchable ? IntegerLast() : THE_NB_GRAZING_PAIRS)
+              >= THE_NB_GRAZING_PAIRS
+            && (!isPatchable || !BuildPatch(aMFAdjacent)))
         {
           myIsGrazing = true;
           return;
@@ -198,6 +214,7 @@ public: //! @name Perform the operation
       occ::handle<BRepTools_History>                         aHistoryBest = myHistory;
       NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAnchoredBest;
       NCollection_List<TopoDS_Shape>                         aDegeneratedBest;
+      NCollection_List<TopoDS_Shape>                         aPatchFacesBest;
       int                                                    aBestQuality = -1;
 
       Message_ProgressScope aPSExt(aPS.Next(2), nullptr, aNbAttempts);
@@ -248,6 +265,7 @@ public: //! @name Perform the operation
           myFaces.Clear();
           myAnchoredFaces.Clear();
           myDegeneratedFaces.Clear();
+          myPatchFaces.Clear();
           myHistory = new BRepTools_History();
           myHistory->Merge(anExtHistory);
 
@@ -258,13 +276,16 @@ public: //! @name Perform the operation
           }
 
           // The reconstruction is complete when every adjacent face has been trimmed by
-          // the bounds of its original face. Otherwise it is rated by the number of the
-          // faces trimmed that way: the faces that could not be trimmed at all are left
-          // out of the reconstruction, the faces whose trim degenerated are kept
-          // untrimmed, and either kind makes the rebuilt solids invalid.
-          isComplete =
-            !myTrimFailed && !myTrimDegenerated && myFaces.Extent() == aMFAdjacent.Extent();
-          const int aQuality = myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated;
+          // the bounds of its original face (and the patch by the faces it is tangent to).
+          // Otherwise it is rated by the number of the faces trimmed that way: the faces
+          // that could not be trimmed at all are left out of the reconstruction, the faces
+          // whose trim degenerated are kept untrimmed, and either kind makes the rebuilt
+          // solids invalid.
+          const bool isPatchDone = myPatch.IsNull() || !myPatchFaces.IsEmpty();
+          isComplete             = !myTrimFailed && !myTrimDegenerated && isPatchDone
+                       && myFaces.Extent() == aMFAdjacent.Extent();
+          const int aQuality =
+            myTrimFailed ? -1 : myFaces.Extent() - myNbDegenerated + (isPatchDone ? 1 : 0);
           if (aPass == 0)
           {
             aQualityFirstPass = aQuality;
@@ -276,6 +297,7 @@ public: //! @name Perform the operation
             anAnchoredBest   = myAnchoredFaces;
             aDegeneratedBest = myDegeneratedFaces;
             aHistoryBest     = myHistory;
+            aPatchFacesBest  = myPatchFaces;
           }
         }
 
@@ -311,6 +333,31 @@ public: //! @name Perform the operation
           myFacesNotRebuilt.Append(aMFAdjacent(i));
         }
       }
+
+      // The pieces of the patch join the reconstruction as the images of the patch itself
+      // (it is not a face of the solids, so nothing is replaced by them). Their orientation
+      // has been checked against the faces they are tangent to.
+      if (!myPatch.IsNull())
+      {
+        myPatchFaces = aPatchFacesBest;
+        if (myPatchFaces.IsEmpty())
+        {
+          NCollection_List<TopoDS_Shape>::Iterator itP(myPatchedFaces);
+          for (; itP.More(); itP.Next())
+          {
+            myFacesNotRebuilt.Append(itP.Value());
+          }
+        }
+        else
+        {
+          myFaces.Add(myPatch, myPatchFaces);
+          NCollection_List<TopoDS_Shape>::Iterator itP(myPatchFaces);
+          for (; itP.More(); itP.Next())
+          {
+            myAnchoredFaces.Add(itP.Value());
+          }
+        }
+      }
     }
     catch (Standard_Failure const&)
     {
@@ -337,6 +384,18 @@ public: //! @name Obtain the result
 
   //! Returns the adjacent faces meeting each other at grazing angles
   const NCollection_List<TopoDS_Shape>& GrazingFaces() const { return myGrazingFaces; }
+
+  //! Shows whether a part of the gap is covered by a patch instead of extended faces
+  bool IsPatched() const { return !myPatch.IsNull(); }
+
+  //! Returns the adjacent faces whose part of the gap is covered by the patch
+  const NCollection_List<TopoDS_Shape>& PatchedFaces() const { return myPatchedFaces; }
+
+  //! Returns the patch (the extended surface the pieces filling the gap are cut from)
+  const TopoDS_Face& Patch() const { return myPatch; }
+
+  //! Returns the size of the feature (the diagonal of its bounding box)
+  double FeatureSize() const { return myFeatureSize; }
 
   //! Returns the Images map of the adjacent faces
   const NCollection_IndexedDataMap<TopoDS_Shape,
@@ -1393,6 +1452,375 @@ private: //! @name Private methods performing the operation
     return aS;
   }
 
+  //! Builds the patch covering the part of the gap next to the grazing faces, and takes these
+  //! faces out of the adjacent faces to extend. The patched faces are the grazing faces with
+  //! the faces tangent to them along the edges cut by the feature and the faces coincident
+  //! with them: no boundary between them has to be found inside the gap. The patch is a plate
+  //! surface passing through their edges with the feature, tangent to them, extended beyond the
+  //! gap to meet the extensions of the other adjacent faces. Returns false if no such patch
+  //! fitting the edges could be built.
+  bool BuildPatch(NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>& theMFAdjacent)
+  {
+    // The patched faces
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aMPatched;
+    NCollection_List<TopoDS_Shape>::Iterator                      itG(myGrazingFaces);
+    for (; itG.More(); itG.Next())
+    {
+      aMPatched.Add(itG.Value());
+    }
+    for (bool isAdded = true; isAdded;)
+    {
+      isAdded = false;
+      for (int i = 0; i < myOpenEnds.Length(); ++i)
+      {
+        const TangentPair& aPair = myTangentPairs(myOpenEnds(i).Pair);
+        if (aMPatched.Contains(aPair.Face1) != aMPatched.Contains(aPair.Face2))
+        {
+          aMPatched.Add(aPair.Face1);
+          aMPatched.Add(aPair.Face2);
+          isAdded = true;
+        }
+      }
+      for (int i = 1; i <= myGroups.Extent(); ++i)
+      {
+        bool                                     isAny = false, isAll = true;
+        NCollection_List<TopoDS_Shape>::Iterator itM(myGroups(i));
+        for (; itM.More(); itM.Next())
+        {
+          const bool isPatched = aMPatched.Contains(itM.Value());
+          isAny                = isAny || isPatched;
+          isAll                = isAll && isPatched;
+        }
+        if (isAny && !isAll)
+        {
+          for (itM.Initialize(myGroups(i)); itM.More(); itM.Next())
+          {
+            aMPatched.Add(itM.Value());
+          }
+          isAdded = true;
+        }
+      }
+    }
+
+    // The plate through the edges of the patched faces with the feature, tangent to them
+    GeomPlate_BuildPlateSurface aPlate(3,
+                                       THE_PATCH_NB_POINTS,
+                                       2,
+                                       1.e-5,
+                                       1.e-4,
+                                       0.01,
+                                       0.1,
+                                       false);
+    myPatchEdges.Clear();
+    for (int i = 1; i <= aMPatched.Extent(); ++i)
+    {
+      const TopoDS_Face&              aF = TopoDS::Face(aMPatched(i));
+      const occ::handle<Geom_Surface> aS = BRep_Tool::Surface(aF);
+      TopExp_Explorer                 anExpE(aF, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+        if (!myFeatureEdgesMap.Contains(aE) || BRep_Tool::Degenerated(aE))
+        {
+          continue;
+        }
+        double                          aT1, aT2;
+        const occ::handle<Geom2d_Curve> aC2D = BRep_Tool::CurveOnSurface(aE, aF, aT1, aT2);
+        if (aC2D.IsNull())
+        {
+          return false;
+        }
+        occ::handle<Adaptor3d_CurveOnSurface> aCOS =
+          new Adaptor3d_CurveOnSurface(new Geom2dAdaptor_Curve(aC2D, aT1, aT2),
+                                       new GeomAdaptor_Surface(aS));
+        aPlate.Add(
+          new GeomPlate_CurveConstraint(aCOS, 1, THE_PATCH_NB_POINTS, 1.e-4, 0.01, 0.1));
+        myPatchEdges.Append(PatchEdge{aE, aF, gp_Pnt(), gp_Vec()});
+      }
+    }
+    // A plate through many edges takes very long, and it has never fitted them
+    if (myPatchEdges.IsEmpty() || myPatchEdges.Length() > THE_PATCH_MAX_EDGES)
+    {
+      return false;
+    }
+
+    occ::handle<Geom_BoundedSurface> aSurface;
+    try
+    {
+      OCC_CATCH_SIGNALS
+      aPlate.Perform();
+      if (!aPlate.IsDone() || aPlate.G0Error() > THE_PATCH_MAX_DISTANCE * myFeatureSize
+          || aPlate.G1Error() > THE_PATCH_MAX_ANGLE)
+      {
+        return false;
+      }
+      // The criterion keeps the approximation close to the constraints; without it the
+      // approximation drifts away from them
+      GeomPlate_MakeApprox anApprox(aPlate.Surface(), 1.e-5, 20, 8, 1.e-6, 0, GeomAbs_C1, 1.1);
+      aSurface = anApprox.Surface();
+      if (aSurface.IsNull())
+      {
+        return false;
+      }
+      // Extended beyond the gap to meet the extensions of the other adjacent faces
+      for (const bool isU : {true, false})
+      {
+        for (const bool isAfter : {true, false})
+        {
+          GeomLib::ExtendSurfByLength(aSurface, myFeatureSize, 1, isU, isAfter);
+        }
+      }
+    }
+    catch (Standard_Failure const&)
+    {
+      return false;
+    }
+    BRepLib_MakeFace aMF(aSurface, Precision::Confusion());
+    if (!aMF.IsDone())
+    {
+      return false;
+    }
+    TopoDS_Face aPatch = aMF.Face();
+
+    // The fit along the edges sets the tolerance of the patch, the normals of the patched
+    // faces there its orientation
+    double                     aU1, aU2, aV1, aV2;
+    GeomAPI_ProjectPointOnSurf aProj;
+    aSurface->Bounds(aU1, aU2, aV1, aV2);
+    aProj.Init(aSurface, aU1, aU2, aV1, aV2);
+    double aMaxDist = 0.0;
+    int    aNbSame = 0, aNbOpposite = 0;
+    for (int i = 0; i < myPatchEdges.Length(); ++i)
+    {
+      PatchEdge&        aPE = myPatchEdges(i);
+      BRepAdaptor_Curve aBAC(aPE.Edge);
+      const double      aT1 = aBAC.FirstParameter(), aT2 = aBAC.LastParameter();
+      for (int k = 0; k <= THE_PATCH_NB_CHECKS; ++k)
+      {
+        const double aT = aT1 + (aT2 - aT1) * k / THE_PATCH_NB_CHECKS;
+        aProj.Perform(aBAC.Value(aT));
+        if (!aProj.IsDone() || aProj.NbPoints() == 0)
+        {
+          return false;
+        }
+        aMaxDist = std::max(aMaxDist, aProj.LowerDistance());
+      }
+
+      // The middle of the edge and the direction into the face there
+      gp_Pnt aP;
+      gp_Vec aTangent;
+      aBAC.D1(0.5 * (aT1 + aT2), aP, aTangent);
+      aPE.Point = aP;
+      double                          aCT1, aCT2;
+      const occ::handle<Geom2d_Curve> aC2D = BRep_Tool::CurveOnSurface(aPE.Edge, aPE.Face, aCT1, aCT2);
+      const gp_Pnt2d    aUV = aC2D->Value(0.5 * (aCT1 + aCT2));
+      GeomLProp_SLProps aProps(BRep_Tool::Surface(aPE.Face), aUV.X(), aUV.Y(), 1, Precision::Confusion());
+      if (!aProps.IsNormalDefined() || aTangent.Magnitude() < gp::Resolution())
+      {
+        continue;
+      }
+      gp_Dir aN = aProps.Normal();
+      if (aPE.Face.Orientation() == TopAbs_REVERSED)
+      {
+        aN.Reverse();
+      }
+      aProj.Perform(aP);
+      double aPU, aPV;
+      aProj.LowerDistanceParameters(aPU, aPV);
+      GeomLProp_SLProps aPatchProps(aSurface, aPU, aPV, 1, Precision::Confusion());
+      if (aPatchProps.IsNormalDefined())
+      {
+        ++(aPatchProps.Normal().Dot(aN) > 0.0 ? aNbSame : aNbOpposite);
+      }
+
+      // The side of the edge the face lies on, found by classifying a point next to it
+      const double aStep =
+        std::max(THE_PATCH_STEP * GCPnts_AbscissaPoint::Length(aBAC), 10. * Precision::Confusion());
+      const gp_Vec aSide = gp_Vec(aN).Crossed(aTangent).Normalized() * aStep;
+      for (const double aSign : {1.0, -1.0})
+      {
+        BRepClass_FaceClassifier aClassifier(aPE.Face,
+                                             aP.Translated(aSide * aSign),
+                                             Precision::Confusion());
+        if (aClassifier.State() == TopAbs_IN)
+        {
+          aPE.Into = aSide * aSign;
+          break;
+        }
+      }
+    }
+    if (aMaxDist > THE_PATCH_MAX_DISTANCE * myFeatureSize || aNbSame * aNbOpposite > 0)
+    {
+      return false;
+    }
+    const double aTol = std::max(1.5 * aMaxDist, Precision::Confusion());
+    BRep_Builder aBB;
+    aBB.UpdateFace(aPatch, aTol);
+    for (TopExp_Explorer anExp(aPatch, TopAbs_EDGE); anExp.More(); anExp.Next())
+    {
+      aBB.UpdateEdge(TopoDS::Edge(anExp.Current()), aTol);
+    }
+    for (TopExp_Explorer anExp(aPatch, TopAbs_VERTEX); anExp.More(); anExp.Next())
+    {
+      aBB.UpdateVertex(TopoDS::Vertex(anExp.Current()), aTol);
+    }
+    if (aNbOpposite > 0)
+    {
+      aPatch.Reverse();
+    }
+    myPatch = aPatch;
+
+    // The rest of the adjacent faces is extended as usual
+    myPatchedFaces.Clear();
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aMRest;
+    for (int i = 1; i <= theMFAdjacent.Extent(); ++i)
+    {
+      if (aMPatched.Contains(theMFAdjacent(i)))
+      {
+        myPatchedFaces.Append(theMFAdjacent(i));
+      }
+      else
+      {
+        aMRest.Add(theMFAdjacent(i));
+      }
+    }
+    theMFAdjacent = aMRest;
+    myGroups.Clear();
+    FindTangentPairs(theMFAdjacent);
+    return true;
+  }
+
+  //! Trims the patch by the edges of the patched faces with the feature, after its
+  //! intersection with the extended adjacent faces. The pieces lying in the gap are kept:
+  //! bounded by these edges and the extended faces (not touching the bounds of the patch),
+  //! on the other side of the edges than the patched faces.
+  void TrimPatch(const NCollection_IndexedDataMap<TopoDS_Shape,
+                                                  NCollection_List<TopoDS_Shape>,
+                                                  TopTools_ShapeMapHasher>& theEFExtMap,
+                 BOPAlgo_Builder&                                         theGFInter,
+                 const bool                                               theIsIntersected)
+  {
+    myPatchFaces.Clear();
+
+    // The splits of the patch and their edges on the bounds of the patch
+    NCollection_List<TopoDS_Shape>                         aSplits;
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMBounds;
+    if (theIsIntersected)
+    {
+      TakeModified(myPatch, theGFInter, aSplits);
+    }
+    else
+    {
+      aSplits.Append(myPatch);
+    }
+    for (TopExp_Explorer anExpE(myPatch, TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+      if (BRep_Tool::Degenerated(aE) || BRep_Tool::IsClosed(aE, myPatch))
+      {
+        continue;
+      }
+      NCollection_List<TopoDS_Shape> aLEIm;
+      if (theIsIntersected)
+      {
+        TakeModified(aE, theGFInter, aLEIm);
+      }
+      else
+      {
+        aLEIm.Append(aE);
+      }
+      NCollection_List<TopoDS_Shape>::Iterator itLEIm(aLEIm);
+      for (; itLEIm.More(); itLEIm.Next())
+      {
+        const NCollection_List<TopoDS_Shape>* pLF = theEFExtMap.Seek(itLEIm.Value());
+        if (!pLF || pLF->Extent() == 1)
+        {
+          aMBounds.Add(itLEIm.Value());
+        }
+      }
+    }
+
+    // Split by the edges of the patched faces
+    BOPAlgo_Builder aGFTrim;
+    aGFTrim.SetArguments(aSplits);
+    for (int i = 0; i < myPatchEdges.Length(); ++i)
+    {
+      aGFTrim.AddArgument(myPatchEdges(i).Edge);
+    }
+    aGFTrim.SetGlue(BOPAlgo_GlueShift);
+    aGFTrim.SetRunParallel(myRunParallel);
+    aGFTrim.SetFuzzyValue(myFuzzyValue);
+    aGFTrim.SetNonDestructive(true);
+    aGFTrim.Perform();
+    if (aGFTrim.HasErrors())
+    {
+      return;
+    }
+    NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> aMBoundsIm;
+    for (NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher>::Iterator itB(aMBounds); itB.More();
+         itB.Next())
+    {
+      TakeModified(itB.Value(), aGFTrim, aMBoundsIm);
+    }
+
+    // The pieces in the gap
+    const double   aTol = BRep_Tool::Tolerance(myPatch);
+    TopExp_Explorer anExpF(aGFTrim.Shape(), TopAbs_FACE);
+    for (; anExpF.More(); anExpF.Next())
+    {
+      const TopoDS_Face& aSp = TopoDS::Face(anExpF.Current());
+      TopExp_Explorer    anExpE(aSp, TopAbs_EDGE);
+      for (; anExpE.More(); anExpE.Next())
+      {
+        if (aMBoundsIm.Contains(anExpE.Current()))
+        {
+          break;
+        }
+      }
+      if (anExpE.More())
+      {
+        continue;
+      }
+      // Next to some edge of a patched face the piece lies on the other side of it, and
+      // next to none on the same side
+      bool isBeyond = false, isOver = false;
+      for (int i = 0; i < myPatchEdges.Length() && !isOver; ++i)
+      {
+        const PatchEdge& aPE = myPatchEdges(i);
+        if (aPE.Into.Magnitude() < gp::Resolution())
+        {
+          continue;
+        }
+        BRepClass_FaceClassifier anOver(aSp, aPE.Point.Translated(aPE.Into), aTol);
+        isOver = anOver.State() == TopAbs_IN;
+        if (!isBeyond)
+        {
+          BRepClass_FaceClassifier aBeyond(aSp, aPE.Point.Translated(-aPE.Into), aTol);
+          isBeyond = aBeyond.State() == TopAbs_IN;
+        }
+      }
+      if (isBeyond && !isOver)
+      {
+        myPatchFaces.Append(aSp);
+      }
+    }
+    RemoveInternalWires(myPatchFaces);
+
+    // Update the history
+    myHistory->Merge(aGFTrim.History());
+    NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> aResMap;
+    NCollection_List<TopoDS_Shape>::Iterator                      itLF(myPatchFaces);
+    for (; itLF.More(); itLF.Next())
+    {
+      TopExp::MapShapes(itLF.Value(), aResMap);
+    }
+    NCollection_List<TopoDS_Shape> aLSplits;
+    aLSplits.Append(aGFTrim.Shape());
+    BRepTools_History aHistRem;
+    MakeRemoved(aLSplits, aHistRem, aResMap);
+    myHistory->Merge(aHistRem);
+  }
+
   //! Recovers the boundaries between the tangent adjacent faces inside the gap from the
   //! ends of their common edges cut off by the feature: two ends facing each other on
   //! one and the same curve are reconnected along it, a single end is extended along
@@ -1871,6 +2299,11 @@ private: //! @name Private methods performing the operation
       }
       BRep_Builder().Add(*pC, anExtFaces(i));
     }
+    // The patch meets the extended faces like one of them
+    if (!myPatch.IsNull())
+    {
+      aGFInter.AddArgument(myPatch);
+    }
     aGFInter.SetRunParallel(myRunParallel);
     aGFInter.SetFuzzyValue(myFuzzyValue);
 
@@ -1913,6 +2346,10 @@ private: //! @name Private methods performing the operation
       const NCollection_List<TopoDS_Shape>& aMembers = myGroups(i);
       const TopoDS_Face& aFExt = TopoDS::Face(theFaceExtFaceMap.FindFromKey(aMembers.First()));
       TrimFace(aFExt, aMembers, anEFExtMap, theFaceExtFaceMap, aGFInter, aPS.Next());
+    }
+    if (!myPatch.IsNull())
+    {
+      TrimPatch(anEFExtMap, aGFInter, aGFInter.Arguments().Extent() > 1);
     }
   }
 
@@ -2245,6 +2682,10 @@ private: //! @name Fields
   bool myHasAdjacentFaces;                //!< Flag to show whether the adjacent faces have been found or not
   bool myIsGrazing;                       //!< Flag to show that the gap has been left unfilled for the grazing adjacent faces
   NCollection_List<TopoDS_Shape> myGrazingFaces; //!< Adjacent faces meeting each other at grazing angles
+  TopoDS_Face myPatch;                    //!< Patch covering the part of the gap next to the grazing faces
+  NCollection_List<TopoDS_Shape> myPatchedFaces; //!< Adjacent faces whose part of the gap the patch covers
+  NCollection_DynamicArray<PatchEdge> myPatchEdges; //!< Edges of the patched faces with the feature, bounding the patch
+  NCollection_List<TopoDS_Shape> myPatchFaces;   //!< Pieces of the patch filling the gap
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> mySolids;                //!< Solids participating in the feature removal
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher> myFaces;  //!< Reconstructed adjacent faces
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myAnchoredFaces; //!< Reconstructed faces validated by an edge of the original face
@@ -2308,6 +2749,26 @@ private: //! @name Fields
 
   //! The faces whose samples differ in the normal by more than this angle are not compared
   static constexpr double THE_GRAZING_PRUNE_ANGLE = 45. * M_PI / 180.;
+
+  //! Number of points of the patch constraints
+  static constexpr int THE_PATCH_NB_POINTS = 15;
+
+  //! Greatest number of adjacent faces of a feature to look for a patch
+  static constexpr int THE_PATCH_MAX_FACES = 60;
+
+  //! Greatest number of edges the patch is built through
+  static constexpr int THE_PATCH_MAX_EDGES = 32;
+
+  //! Greatest distance of the patch from the edges it passes through, relative to the
+  //! size of the feature, and the greatest angle between the patch and the patched faces
+  static constexpr double THE_PATCH_MAX_DISTANCE = 1.e-4;
+  static constexpr double THE_PATCH_MAX_ANGLE    = 5. * M_PI / 180.;
+
+  //! Number of intervals the edges are checked against the patch in
+  static constexpr int THE_PATCH_NB_CHECKS = 8;
+
+  //! Step from an edge of a patched face to tell its sides, relative to its length
+  static constexpr double THE_PATCH_STEP = 0.05;
 };
 
 typedef NCollection_DynamicArray<FillGap> VectorOfFillGap;
