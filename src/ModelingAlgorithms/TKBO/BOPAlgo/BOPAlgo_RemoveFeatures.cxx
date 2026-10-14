@@ -27,6 +27,7 @@
 #include <BOPTools_Set.hxx>
 
 #include <Bnd_Box.hxx>
+#include <GProp_GProps.hxx>
 
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
@@ -44,6 +45,7 @@
 #include <GeomPlate_Surface.hxx>
 
 #include <BRepBndLib.hxx>
+#include <BRepGProp.hxx>
 #include <BRepCheck_Shell.hxx>
 
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -581,7 +583,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       return;
     }
     const TopoDS_Shape&   anInputFeature = itF.Value();
-    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 4);
+    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 6);
 
     if (!isMapsValid)
     {
@@ -736,6 +738,41 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       return;
     }
 
+    // Both extensions keep only the tangent of a B-spline face, which runs off the surface it
+    // was cut from: a wall split by the feature into pieces of one surface is not put back
+    // together. Retry with the spans of all B-spline faces continued; the passing features
+    // never get here, since the continuation breaks some of them.
+    FillGap aFGSpline;
+    aFGSpline.SetFeature(aFeature);
+    aFGSpline.SetEFConnectionMap(anEFMap);
+    aFGSpline.SetFSConnectionMap(anFSMap);
+    aFGSpline.SetRunParallel(myRunParallel);
+    aFGSpline.SetFuzzyValue(myFuzzyValue);
+    aFGSpline.SetOriginalFaces(anOrigins);
+    aFGSpline.SetSplineContinuation(true);
+    aFGSpline.SetRange(aPSFeature.Next());
+    aFGSpline.Perform();
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
+    if (RemoveFeature(aFGSpline.Solids(),
+                      aFGSpline.FeatureFacesMap(),
+                      aFGSpline.HasAdjacentFaces(),
+                      aFGSpline.Faces(),
+                      aFGSpline.AnchoredFaces(),
+                      aFGSpline.History(),
+                      HasHistory(),
+                      aPSFeature.Next()))
+    {
+      aOnRemoved();
+      continue;
+    }
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
+
     // Report the failure with the faces the first reconstruction could not rebuild
     AddWarning(new BOPAlgo_AlertUnableToRemoveTheFeature(anInputFeature));
     const TopoDS_Compound aNotRebuilt = OriginalFaces(aFG.FacesNotRebuilt(), anOrigins);
@@ -794,6 +831,30 @@ void BOPAlgo_RemoveFeatures::CheckPatchTolerance(const TopoDS_Shape& thePatch,
   {
     AddWarning(new BOPAlgo_AlertPatchTolerance(aCExceeding));
   }
+}
+
+//=================================================================================================
+
+//! An image of an adjacent face narrower than this fraction of the size of the feature may
+//! vanish in the reconstruction of the solid: the intersection collapses such slivers
+static constexpr double THE_SLIVER_WIDTH = 1.e-5;
+
+//! Checks whether every face of the shape is narrower than the given width (its area is
+//! less than the width times the size of its box)
+static bool IsSliver(const TopoDS_Shape& theShape, const double theMaxWidth)
+{
+  for (TopExp_Explorer anExp(theShape, TopAbs_FACE); anExp.More(); anExp.Next())
+  {
+    Bnd_Box aBox;
+    BRepBndLib::AddOptimal(anExp.Current(), aBox, false, false);
+    GProp_GProps aProps;
+    BRepGProp::SurfaceProperties(anExp.Current(), aProps);
+    if (!aBox.IsVoid() && aProps.Mass() >= theMaxWidth * sqrt(aBox.SquareExtent()))
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 //=================================================================================================
@@ -1032,6 +1093,13 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
   }
 
   // Validate the result
+  Bnd_Box aFeatureBox;
+  for (const TopoDS_Shape& aFF : theFeatureFacesMap)
+  {
+    BRepBndLib::Add(aFF, aFeatureBox);
+  }
+  const double aSliverWidth =
+    aFeatureBox.IsVoid() ? 0. : THE_SLIVER_WIDTH * sqrt(aFeatureBox.SquareExtent());
   bool bValid = true;
   aNbFK       = aFacesToBeKept.Extent();
   for (int i = 1; i <= aNbFK && bValid; ++i)
@@ -1055,7 +1123,9 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
         break;
       }
     }
-    bValid = anExpF.More();
+    bValid = anExpF.More()
+             || (anAdjImagesAdded.Contains(TopExp_Explorer(aS, TopAbs_FACE).Current())
+                 && IsSliver(aS, aSliverWidth));
   }
 
   if (!bValid)

@@ -63,6 +63,7 @@ public: //! @name Constructors
       : myRunParallel(false),
         myFuzzyValue(0.0),
         myIsLocalExtension(false),
+        myIsSplineContinuation(false),
         mySkipGrazing(false),
         myFeatureSize(0.0),
         myHasAdjacentFaces(false),
@@ -111,6 +112,10 @@ public: //! @name Setters/Getters
   //! Defines whether each adjacent face is extended by the size of the feature faces
   //! it borders instead of the size of the whole feature
   void SetLocalExtension(const bool theIsLocal) { myIsLocalExtension = theIsLocal; }
+
+  //! Defines whether all adjacent faces on non-rational B-spline surfaces are extended by
+  //! continuing the polynomials of their end spans (see ContinuedFace), not only the islands
+  void SetSplineContinuation(const bool theIsOn) { myIsSplineContinuation = theIsOn; }
 
   //! Defines whether the gap is left unfilled when the adjacent faces meet each other at
   //! grazing angles inside it (see FindGrazingPairs)
@@ -171,6 +176,8 @@ public: //! @name Perform the operation
       Bnd_Box aFeatureBox;
       BRepBndLib::Add(myFeature, aFeatureBox);
       myFeatureSize = std::max(sqrt(aFeatureBox.SquareExtent()), Precision::Confusion());
+      myFeatureBox  = aFeatureBox;
+      myFeatureBox.Enlarge(THE_FEATURE_BOX_MARGIN * myFeatureSize);
 
       // The extensions of the adjacent faces meeting each other at grazing angles inside the
       // gap cannot split it between them. If requested, such faces are not extended: their
@@ -554,6 +561,7 @@ private: //! @name Private methods performing the operation
       // Extend the face only in the parametric directions the feature lies in, to keep
       // the extended faces from interfering with each other away from the feature
       bool                                     anExtDirs[4] = {false, false, false, false};
+      bool                                     isIsland     = false;
       NCollection_List<TopoDS_Shape>::Iterator itM(aMembers);
       for (; itM.More(); itM.Next())
       {
@@ -563,6 +571,7 @@ private: //! @name Private methods performing the operation
         {
           anExtDirs[k] = anExtDirs[k] || aMemberDirs[k];
         }
+        isIsland = isIsland || IsIsland(TopoDS::Face(itM.Value()));
       }
 
       // In the local mode the extension is scaled down from the size of the whole feature to
@@ -571,7 +580,7 @@ private: //! @name Private methods performing the operation
         myIsLocalExtension ? theExtLength * LocalFeatureSize(aMembers) / myFeatureSize : theExtLength;
 
       bool              isExhausted = false;
-      const TopoDS_Face aFExt       = ExtendFace(aF, anExtLength, anExtDirs, isExhausted);
+      const TopoDS_Face aFExt       = ExtendFace(aF, anExtLength, anExtDirs, isIsland, isExhausted);
       myIsExtensionExhausted        = myIsExtensionExhausted && isExhausted;
 
       for (itM.Initialize(aMembers); itM.More(); itM.Next())
@@ -949,10 +958,13 @@ private: //! @name Private methods performing the operation
   //! size of the feature, whichever is greater: the extrapolation of such a surface
   //! further than that is meaningless, it curls and self-intersects. theIsExhausted
   //! is set when the length was cut down that way.
+  //! An island face (see IsIsland) on a B-spline surface is extended by continuing the
+  //! polynomials of its end spans (see ContinuedFace).
   TopoDS_Face ExtendFace(const TopoDS_Face& theF,
                          const double       theExtLength,
                          const bool (&theExtDirs)[4],
-                         bool& theIsExhausted)
+                         const bool theIsIsland,
+                         bool&      theIsExhausted)
   {
     Bnd_Box aBox;
     BRepBndLib::Add(theF, aBox);
@@ -963,6 +975,17 @@ private: //! @name Private methods performing the operation
     theIsExhausted           = isFreeForm && theExtLength > aMaxLength;
 
     const double aMargin = THE_EXTENSION_MARGIN * std::max(anExtLength, aFaceSize);
+
+    if (theIsIsland || myIsSplineContinuation)
+    {
+      const bool        anAllDirs[4] = {true, true, true, true};
+      const TopoDS_Face aFExt =
+        ContinuedFace(theF, anExtLength + aMargin, aMargin, theIsIsland ? anAllDirs : theExtDirs);
+      if (!aFExt.IsNull())
+      {
+        return aFExt;
+      }
+    }
 
     TopoDS_Face aFExt;
     BRepLib::ExtendFace(theF,
@@ -1004,10 +1027,196 @@ private: //! @name Private methods performing the operation
     }
   }
 
+  //! Checks whether the outer wire of the face is made of feature edges only: the face is
+  //! the top of a boss standing in the gap, usually a piece of the surface the gap is in
+  bool IsIsland(const TopoDS_Face& theF) const
+  {
+    const TopoDS_Wire anOuterW = BRepTools::OuterWire(theF);
+    if (anOuterW.IsNull())
+    {
+      return false;
+    }
+    bool            hasEdges = false;
+    TopoDS_Iterator itE(anOuterW);
+    for (; itE.More(); itE.Next())
+    {
+      if (BRep_Tool::Degenerated(TopoDS::Edge(itE.Value())))
+      {
+        continue;
+      }
+      if (!myFeatureEdgesMap.Contains(itE.Value()))
+      {
+        return false;
+      }
+      hasEdges = true;
+    }
+    return hasEdges;
+  }
+
+  //! Continues the polynomial of the end span of the B-spline surface in the given direction
+  //! beyond its end by the given length. Unlike the extension by GeomLib::ExtendSurfByLength,
+  //! which only keeps the tangent, this reproduces the surface the face was cut from as long
+  //! as the face lies within one span of it. The parametrization is kept.
+  static void ContinueEndSpan(const occ::handle<Geom_BSplineSurface>& theS,
+                              const bool                              theIsU,
+                              const bool                              theIsAfter,
+                              const double                            theLength)
+  {
+    const int aDeg = theIsU ? theS->UDegree() : theS->VDegree();
+    const int aNbK = theIsU ? theS->NbUKnots() : theS->NbVKnots();
+    if (aNbK > 2)
+    {
+      // Make the end span a Bezier span
+      const int aKInner = theIsAfter ? aNbK - 1 : 2;
+      theIsU ? theS->IncreaseUMultiplicity(aKInner, aDeg) : theS->IncreaseVMultiplicity(aKInner, aDeg);
+    }
+    const int    aKEnd   = theIsAfter ? aNbK : 1;
+    const int    aKInner = theIsAfter ? aNbK - 1 : 2;
+    const double anEnd   = theIsU ? theS->UKnot(aKEnd) : theS->VKnot(aKEnd);
+    const double anInner = theIsU ? theS->UKnot(aKInner) : theS->VKnot(aKInner);
+
+    // The parametric length from the speed of the surface across the end
+    double aU1, aU2, aV1, aV2;
+    theS->Bounds(aU1, aU2, aV1, aV2);
+    double aSpeed = 0.;
+    for (int i = 0; i < THE_NB_DIRECTION_SAMPLES; ++i)
+    {
+      const double aT = (i + 0.5) / THE_NB_DIRECTION_SAMPLES;
+      gp_Pnt       aP;
+      gp_Vec       aDU, aDV;
+      if (theIsU)
+      {
+        theS->D1(anEnd, aV1 + (aV2 - aV1) * aT, aP, aDU, aDV);
+      }
+      else
+      {
+        theS->D1(aU1 + (aU2 - aU1) * aT, anEnd, aP, aDU, aDV);
+      }
+      aSpeed += (theIsU ? aDU : aDV).Magnitude() / THE_NB_DIRECTION_SAMPLES;
+    }
+    if (aSpeed < gp::Resolution())
+    {
+      return;
+    }
+    const double aNewEnd = anEnd + (theIsAfter ? 1. : -1.) * theLength / aSpeed;
+    const double aT      = (aNewEnd - anInner) / (anEnd - anInner);
+
+    const int aNbPoles = theIsU ? theS->NbUPoles() : theS->NbVPoles();
+    const int aNbOther = theIsU ? theS->NbVPoles() : theS->NbUPoles();
+    std::vector<gp_XYZ> aP(aDeg + 1), aQ(aDeg + 1);
+    for (int j = 1; j <= aNbOther; ++j)
+    {
+      // The poles of the end span from the inner knot to the end
+      for (int k = 0; k <= aDeg; ++k)
+      {
+        const int i = theIsAfter ? aNbPoles - aDeg + k : aDeg + 1 - k;
+        aP[k]       = (theIsU ? theS->Pole(i, j) : theS->Pole(j, i)).XYZ();
+      }
+      // de Casteljau at aT > 1 gives the poles of the span continued to the new end
+      aQ[0] = aP[0];
+      for (int r = 1; r <= aDeg; ++r)
+      {
+        for (int k = 0; k <= aDeg - r; ++k)
+        {
+          aP[k] = aP[k] * (1. - aT) + aP[k + 1] * aT;
+        }
+        aQ[r] = aP[0];
+      }
+      for (int k = 0; k <= aDeg; ++k)
+      {
+        const int i = theIsAfter ? aNbPoles - aDeg + k : aDeg + 1 - k;
+        theIsU ? theS->SetPole(i, j, gp_Pnt(aQ[k])) : theS->SetPole(j, i, gp_Pnt(aQ[k]));
+      }
+    }
+    theIsU ? theS->SetUKnot(aKEnd, aNewEnd) : theS->SetVKnot(aKEnd, aNewEnd);
+  }
+
+  //! Returns the parameter between theFrom and theTo (in the direction U or V) of the first
+  //! iso line of the surface lying completely outside the box, or theTo if there is none
+  static double FirstIsoOutOfBox(const occ::handle<Geom_Surface>& theS,
+                                 const bool                       theIsU,
+                                 const double                     theFrom,
+                                 const double                     theTo,
+                                 const double                     theOtherMin,
+                                 const double                     theOtherMax,
+                                 const Bnd_Box&                   theBox)
+  {
+    for (int i = 1; i <= THE_NB_EXTENSION_STEPS; ++i)
+    {
+      const double aParam = theFrom + (theTo - theFrom) * i / THE_NB_EXTENSION_STEPS;
+      bool         isOut  = true;
+      for (int j = 0; j <= THE_NB_EXTENSION_STEPS && isOut; ++j)
+      {
+        const double anOther = theOtherMin + (theOtherMax - theOtherMin) * j / THE_NB_EXTENSION_STEPS;
+        isOut = theBox.IsOut(theIsU ? theS->Value(aParam, anOther) : theS->Value(anOther, aParam));
+      }
+      if (isOut)
+      {
+        return aParam;
+      }
+    }
+    return theTo;
+  }
+
+  //! Builds the face on the surface of the given face with the polynomials of its end spans
+  //! continued by the given length in all directions (see ContinueEndSpan), but not further
+  //! than the box of the feature: far from its domain the polynomial runs off the surface it
+  //! was cut from. Returns a null face if the surface is not a non-rational, non-periodic
+  //! B-spline.
+  TopoDS_Face ContinuedFace(const TopoDS_Face& theF,
+                            const double       theLength,
+                            const double       theMargin,
+                            const bool (&theExtDirs)[4]) const
+  {
+    const occ::handle<Geom_BSplineSurface> aBS =
+      occ::down_cast<Geom_BSplineSurface>(BRep_Tool::Surface(theF));
+    if (aBS.IsNull() || aBS->IsURational() || aBS->IsVRational() || aBS->IsUPeriodic()
+        || aBS->IsVPeriodic())
+    {
+      return TopoDS_Face();
+    }
+    try
+    {
+      OCC_CATCH_SIGNALS
+      const occ::handle<Geom_BSplineSurface> aS = occ::down_cast<Geom_BSplineSurface>(aBS->Copy());
+      for (const bool isU : {true, false})
+      {
+        for (const bool isAfter : {true, false})
+        {
+          ContinueEndSpan(aS, isU, isAfter, theExtDirs[(isU ? 0 : 2) + (isAfter ? 1 : 0)] ? theLength : theMargin);
+        }
+      }
+      double aU1, aU2, aV1, aV2, aNewU1, aNewU2, aNewV1, aNewV2;
+      aBS->Bounds(aU1, aU2, aV1, aV2);
+      aS->Bounds(aNewU1, aNewU2, aNewV1, aNewV2);
+      aNewU1 = FirstIsoOutOfBox(aS, true, aU1, aNewU1, aNewV1, aNewV2, myFeatureBox);
+      aNewU2 = FirstIsoOutOfBox(aS, true, aU2, aNewU2, aNewV1, aNewV2, myFeatureBox);
+      aNewV1 = FirstIsoOutOfBox(aS, false, aV1, aNewV1, aNewU1, aNewU2, myFeatureBox);
+      aNewV2 = FirstIsoOutOfBox(aS, false, aV2, aNewV2, aNewU1, aNewU2, myFeatureBox);
+      BRepLib_MakeFace aMF(aS, aNewU1, aNewU2, aNewV1, aNewV2, BRep_Tool::Tolerance(theF));
+      if (!aMF.IsDone())
+      {
+        return TopoDS_Face();
+      }
+      TopoDS_Face aFace = aMF.Face();
+      if (theF.Orientation() == TopAbs_REVERSED)
+      {
+        aFace.Reverse();
+      }
+      return aFace;
+    }
+    catch (Standard_Failure const&)
+    {
+      return TopoDS_Face();
+    }
+  }
+
   //! Finds the parametric directions in which the face has to be extended to cover the
   //! gap left by the feature: the directions the feature edges of the face are facing.
-  //! A face touching the feature by closed loops of feature edges only (a face with a
-  //! hole in it) needs no extension - its surface already covers the gap.
+  //! A face touching the feature by inner loops of feature edges only (a face with a
+  //! hole in it) needs no extension - its surface already covers the gap. A face whose
+  //! outer loop is made of feature edges only (the top of a boss standing in the gap)
+  //! has the gap all around it and is extended in all directions.
   //! The directions are expressed in the parametric space of the reference face:
   //! the face itself, or the representative of its group of coincident faces.
   void FindExtensionDirections(const TopoDS_Face& theF,
@@ -1024,6 +1233,12 @@ private: //! @name Private methods performing the operation
     if (!isSameFace)
     {
       aSRef = BRep_Tool::Surface(theFRef);
+    }
+
+    if (IsIsland(aFF))
+    {
+      theExtDirs[0] = theExtDirs[1] = theExtDirs[2] = theExtDirs[3] = true;
+      return;
     }
 
     TopoDS_Iterator itW(aFF);
@@ -2730,6 +2945,7 @@ private: //! @name Fields
   bool myRunParallel;                     //!< Defines the mode of processing of the single feature
   double myFuzzyValue;                    //!< Fuzzy value for the intersections
   bool myIsLocalExtension;                //!< Extend each face by the size of the feature faces it borders
+  bool myIsSplineContinuation;            //!< Continue the spans of all B-spline faces
   bool mySkipGrazing;                     //!< Leave the gap unfilled when the adjacent faces graze each other
   TopoDS_Shape myFeature;                             //!< Feature to remove
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myEFMap; //!< EF Connection map to find adjacent faces
@@ -2739,6 +2955,7 @@ private: //! @name Fields
   // Results
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureFacesMap;              //!< Faces of the feature
   double myFeatureSize;                   //!< Size of the feature (the diagonal of its bounding box)
+  Bnd_Box myFeatureBox; //!< Box of the feature enlarged by THE_FEATURE_BOX_MARGIN of its size
   NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> myFeatureEdgesMap;       //!< Edges of the feature
   NCollection_DynamicArray<TangentPair> myTangentPairs;  //!< Pairs of adjacent faces tangent to each other
   NCollection_DynamicArray<OpenEnd> myOpenEnds;          //!< Ends of the edges between tangent faces cut off by the feature
