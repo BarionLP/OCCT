@@ -1000,8 +1000,18 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
   // Add faces of the input shape
   aMV.AddArgument(anOrigF);
 
+  Bnd_Box aFeatureBox;
+  for (const TopoDS_Shape& aFF : theFeatureFacesMap)
+  {
+    BRepBndLib::Add(aFF, aFeatureBox);
+  }
+  const double aSliverWidth =
+    aFeatureBox.IsVoid() ? 0. : THE_SLIVER_WIDTH * sqrt(aFeatureBox.SquareExtent());
+
   // Add reconstructed adjacent faces. The faces rebuilt as a group of coincident
-  // faces share their images, which are added once.
+  // faces share their images, which are added once. Slivers are left out: the
+  // intersection would collapse them anyway, and on free-form faces it takes minutes
+  // over them.
   NCollection_Map<TopoDS_Shape, TopTools_ShapeMapHasher> anAdjImagesAdded;
   for (int i = 1; i <= aNbAF; ++i)
   {
@@ -1016,7 +1026,8 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
     NCollection_List<TopoDS_Shape>::Iterator itLFAIm(theAdjFaces(i));
     for (; itLFAIm.More(); itLFAIm.Next())
     {
-      if (anAdjImagesAdded.Add(itLFAIm.Value()))
+      if (anAdjImagesAdded.Add(itLFAIm.Value())
+          && !IsSliver(itLFAIm.Value(), aSliverWidth))
       {
         aLFA.Append(itLFAIm.Value());
       }
@@ -1096,13 +1107,6 @@ bool BOPAlgo_RemoveFeatures::RemoveFeature(
   }
 
   // Validate the result
-  Bnd_Box aFeatureBox;
-  for (const TopoDS_Shape& aFF : theFeatureFacesMap)
-  {
-    BRepBndLib::Add(aFF, aFeatureBox);
-  }
-  const double aSliverWidth =
-    aFeatureBox.IsVoid() ? 0. : THE_SLIVER_WIDTH * sqrt(aFeatureBox.SquareExtent());
   bool bValid = true;
   aNbFK       = aFacesToBeKept.Extent();
   for (int i = 1; i <= aNbFK && bValid; ++i)
