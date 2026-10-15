@@ -738,10 +738,11 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       return;
     }
 
-    // Both extensions keep only the tangent of a B-spline face, which runs off the surface it
+    // The extensions keep only the tangent of a B-spline face, which runs off the surface it
     // was cut from: a wall split by the feature into pieces of one surface is not put back
-    // together. Retry with the spans of all B-spline faces continued; the passing features
-    // never get here, since the continuation breaks some of them.
+    // together. Retry with the spans of all B-spline faces continued and such pieces rebuilt
+    // as one face; tried only after the other attempts have failed, since the continuation
+    // breaks some features they remove.
     FillGap aFGSpline;
     aFGSpline.SetFeature(aFeature);
     aFGSpline.SetEFConnectionMap(anEFMap);
@@ -749,6 +750,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     aFGSpline.SetRunParallel(myRunParallel);
     aFGSpline.SetFuzzyValue(myFuzzyValue);
     aFGSpline.SetOriginalFaces(anOrigins);
+    aFGSpline.SetToSkipGrazing(mySkipGrazingFeatures);
     aFGSpline.SetSplineContinuation(true);
     aFGSpline.SetRange(aPSFeature.Next());
     aFGSpline.Perform();
@@ -756,14 +758,15 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
     {
       return;
     }
-    if (RemoveFeature(aFGSpline.Solids(),
-                      aFGSpline.FeatureFacesMap(),
-                      aFGSpline.HasAdjacentFaces(),
-                      aFGSpline.Faces(),
-                      aFGSpline.AnchoredFaces(),
-                      aFGSpline.History(),
-                      HasHistory(),
-                      aPSFeature.Next()))
+    if (!aFGSpline.IsGrazing()
+        && RemoveFeature(aFGSpline.Solids(),
+                         aFGSpline.FeatureFacesMap(),
+                         aFGSpline.HasAdjacentFaces(),
+                         aFGSpline.Faces(),
+                         aFGSpline.AnchoredFaces(),
+                         aFGSpline.History(),
+                         HasHistory(),
+                         aPSFeature.Next()))
     {
       aOnRemoved();
       continue;

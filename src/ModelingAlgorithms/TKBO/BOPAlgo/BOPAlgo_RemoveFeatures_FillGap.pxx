@@ -556,7 +556,7 @@ private: //! @name Private methods performing the operation
       const TopoDS_Shape* pOrigin = myOrigins ? myOrigins->Seek(aFRep) : nullptr;
       const TopoDS_Face   aF      = pOrigin
                                       ? OnOriginalSurface(MakeGroupFace(aMembers), TopoDS::Face(*pOrigin))
-                                      : MakeGroupFace(aMembers);
+                                      : MakeGroupFace(aMembers, GroupSurface(aMembers));
 
       // Extend the face only in the parametric directions the feature lies in, to keep
       // the extended faces from interfering with each other away from the feature
@@ -589,6 +589,19 @@ private: //! @name Private methods performing the operation
         myHistory->AddModified(itM.Value(), aFExt);
       }
     }
+  }
+
+  //! Returns the surface to rebuild a group of B-spline pieces of one surface on (see
+  //! AreSplinePieces): the surface of the representative continued to cover the others.
+  //! Null for the other groups, which are rebuilt on the surface of the representative.
+  occ::handle<Geom_Surface> GroupSurface(const NCollection_List<TopoDS_Shape>& theMembers) const
+  {
+    if (!myIsSplineContinuation || theMembers.Extent() < 2)
+    {
+      return nullptr;
+    }
+    const bool anAllDirs[4] = {true, true, true, true};
+    return ContinuedSurface(TopoDS::Face(theMembers.First()), myFeatureSize, myFeatureSize, anAllDirs);
   }
 
   //! Returns the size (the diagonal of the box) of the feature faces sharing an edge with
@@ -651,7 +664,9 @@ private: //! @name Private methods performing the operation
       for (int j = i + 1; j <= aNbFA; ++j)
       {
         const TopoDS_Face& aFOther = TopoDS::Face(theMFAdjacent(j));
-        if (!aGrouped.Contains(aFOther) && AreCoincident(aF, aFOther))
+        if (!aGrouped.Contains(aFOther)
+            && (AreCoincident(aF, aFOther)
+                || (myIsSplineContinuation && AreSplinePieces(aF, aFOther))))
         {
           aGrouped.Add(aFOther);
           aMembers.Append(aFOther);
@@ -840,7 +855,8 @@ private: //! @name Private methods performing the operation
 
   //! Builds the face covering all the faces of the group on the surface of its
   //! representative (the first face). A group of a single face is the face itself.
-  static TopoDS_Face MakeGroupFace(const NCollection_List<TopoDS_Shape>& theMembers)
+  static TopoDS_Face MakeGroupFace(const NCollection_List<TopoDS_Shape>& theMembers,
+                                   const occ::handle<Geom_Surface>&      theSurface = nullptr)
   {
     const TopoDS_Face& aFRep = TopoDS::Face(theMembers.First());
     if (theMembers.Extent() == 1)
@@ -848,7 +864,7 @@ private: //! @name Private methods performing the operation
       return aFRep;
     }
 
-    occ::handle<Geom_Surface> aS = BRep_Tool::Surface(aFRep);
+    occ::handle<Geom_Surface> aS = theSurface.IsNull() ? BRep_Tool::Surface(aFRep) : theSurface;
     double                    aUMin, aUMax, aVMin, aVMax;
     BRepTools::UVBounds(aFRep, aUMin, aUMax, aVMin, aVMax);
     const double aUPeriod = aS->IsUPeriodic() ? aS->UPeriod() : 0.0;
@@ -1131,6 +1147,106 @@ private: //! @name Private methods performing the operation
     theIsU ? theS->SetUKnot(aKEnd, aNewEnd) : theS->SetVKnot(aKEnd, aNewEnd);
   }
 
+  //! Returns a copy of the surface of the face with the polynomials of its end spans continued
+  //! by the given length in the given directions and by the margin in the others (see
+  //! ContinueEndSpan), or a null handle if the surface is not a non-rational, non-periodic B-spline
+  static occ::handle<Geom_BSplineSurface> ContinuedSurface(const TopoDS_Face& theF,
+                                                           const double       theLength,
+                                                           const double       theMargin,
+                                                           const bool (&theExtDirs)[4])
+  {
+    const occ::handle<Geom_BSplineSurface> aBS =
+      occ::down_cast<Geom_BSplineSurface>(BRep_Tool::Surface(theF));
+    if (aBS.IsNull() || aBS->IsURational() || aBS->IsVRational() || aBS->IsUPeriodic()
+        || aBS->IsVPeriodic())
+    {
+      return nullptr;
+    }
+    try
+    {
+      OCC_CATCH_SIGNALS
+      const occ::handle<Geom_BSplineSurface> aS = occ::down_cast<Geom_BSplineSurface>(aBS->Copy());
+      for (const bool isU : {true, false})
+      {
+        for (const bool isAfter : {true, false})
+        {
+          ContinueEndSpan(aS, isU, isAfter, theExtDirs[(isU ? 0 : 2) + (isAfter ? 1 : 0)] ? theLength : theMargin);
+        }
+      }
+      return aS;
+    }
+    catch (Standard_Failure const&)
+    {
+      return nullptr;
+    }
+  }
+
+  //! Checks whether the second face lies on the surface of the first one continued beyond its
+  //! end spans (see ContinueEndSpan) and looks the same way: two pieces of one B-spline surface
+  //! the feature has split, which the extension would turn into coinciding surfaces
+  bool AreSplinePieces(const TopoDS_Face& theF1, const TopoDS_Face& theF2) const
+  {
+    const bool                             anAllDirs[4] = {true, true, true, true};
+    const occ::handle<Geom_BSplineSurface> aS1 = ContinuedSurface(theF1, myFeatureSize, myFeatureSize, anAllDirs);
+    if (aS1.IsNull() || occ::down_cast<Geom_BSplineSurface>(BRep_Tool::Surface(theF2)).IsNull())
+    {
+      return false;
+    }
+    const double aTol = std::max({BRep_Tool::Tolerance(theF1),
+                                  BRep_Tool::Tolerance(theF2),
+                                  THE_SPLINE_PIECES_DEVIATION * myFeatureSize});
+    TopExp_Explorer anExpE(theF2, TopAbs_EDGE);
+    for (; anExpE.More(); anExpE.Next())
+    {
+      const TopoDS_Edge& aE = TopoDS::Edge(anExpE.Current());
+      if (BRep_Tool::Degenerated(aE))
+      {
+        continue;
+      }
+      BRepAdaptor_Curve aBAC(aE);
+      for (int k = 0; k <= THE_NB_DIRECTION_SAMPLES; ++k)
+      {
+        const gp_Pnt aP = aBAC.Value(aBAC.FirstParameter()
+                                     + (aBAC.LastParameter() - aBAC.FirstParameter()) * k / THE_NB_DIRECTION_SAMPLES);
+        GeomAPI_ProjectPointOnSurf aProj(aP, aS1);
+        if (!aProj.IsDone() || aProj.NbPoints() == 0 || aProj.LowerDistance() > aTol)
+        {
+          return false;
+        }
+      }
+    }
+    // The faces have to look the same way
+    for (anExpE.Init(theF2, TopAbs_EDGE); anExpE.More(); anExpE.Next())
+    {
+      gp_Pnt aP;
+      gp_Dir aDN2;
+      if (!NormalToFaceOnEdge(TopoDS::Edge(anExpE.Current()), theF2, aP, aDN2))
+      {
+        continue;
+      }
+      GeomAPI_ProjectPointOnSurf aProj(aP, aS1);
+      if (!aProj.IsDone() || aProj.NbPoints() == 0)
+      {
+        return false;
+      }
+      double aU, aV;
+      aProj.LowerDistanceParameters(aU, aV);
+      gp_Vec aDU, aDV;
+      aS1->D1(aU, aV, aP, aDU, aDV);
+      gp_Vec aDN1 = aDU.Crossed(aDV);
+      if (aDN1.SquareMagnitude() < gp::Resolution())
+      {
+        continue;
+      }
+      if (theF1.Orientation() == TopAbs_REVERSED)
+      {
+        aDN1.Reverse();
+      }
+      return aDN1.Dot(aDN2) > 0.0;
+    }
+    return false;
+  }
+
   //! Returns the parameter between theFrom and theTo (in the direction U or V) of the first
   //! iso line of the surface lying completely outside the box, or theTo if there is none
   static double FirstIsoOutOfBox(const occ::handle<Geom_Surface>& theS,
@@ -1168,26 +1284,16 @@ private: //! @name Private methods performing the operation
                             const double       theMargin,
                             const bool (&theExtDirs)[4]) const
   {
-    const occ::handle<Geom_BSplineSurface> aBS =
-      occ::down_cast<Geom_BSplineSurface>(BRep_Tool::Surface(theF));
-    if (aBS.IsNull() || aBS->IsURational() || aBS->IsVRational() || aBS->IsUPeriodic()
-        || aBS->IsVPeriodic())
+    const occ::handle<Geom_BSplineSurface> aS = ContinuedSurface(theF, theLength, theMargin, theExtDirs);
+    if (aS.IsNull())
     {
       return TopoDS_Face();
     }
     try
     {
       OCC_CATCH_SIGNALS
-      const occ::handle<Geom_BSplineSurface> aS = occ::down_cast<Geom_BSplineSurface>(aBS->Copy());
-      for (const bool isU : {true, false})
-      {
-        for (const bool isAfter : {true, false})
-        {
-          ContinueEndSpan(aS, isU, isAfter, theExtDirs[(isU ? 0 : 2) + (isAfter ? 1 : 0)] ? theLength : theMargin);
-        }
-      }
       double aU1, aU2, aV1, aV2, aNewU1, aNewU2, aNewV1, aNewV2;
-      aBS->Bounds(aU1, aU2, aV1, aV2);
+      BRepTools::UVBounds(theF, aU1, aU2, aV1, aV2);
       aS->Bounds(aNewU1, aNewU2, aNewV1, aNewV2);
       aNewU1 = FirstIsoOutOfBox(aS, true, aU1, aNewU1, aNewV1, aNewV2, myFeatureBox);
       aNewU2 = FirstIsoOutOfBox(aS, true, aU2, aNewU2, aNewV1, aNewV2, myFeatureBox);
@@ -3001,6 +3107,10 @@ private: //! @name Fields
   //! Greatest deviation of the recovered boundary from the tangent face it is not
   //! built on, relative to the length of the extension
   static constexpr double THE_MAX_DEVIATION = 1.e-3;
+
+  //! Greatest distance of a face from the continued surface of another one, relative to the
+  //! size of the feature, for the two to be taken as pieces of one surface
+  static constexpr double THE_SPLINE_PIECES_DEVIATION = 1.e-5;
 
   //! Relative margin added to the box of the feature to stop the extension of the
   //! recovered boundaries
