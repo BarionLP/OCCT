@@ -19,6 +19,9 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_Surface.hxx>
+#include <Geom2d_Line.hxx>
+#include <Geom2d_TrimmedCurve.hxx>
+#include <Geom2dAPI_InterCurveCurve.hxx>
 #include <GeomAdaptor_Curve.hxx>
 #include <GeomAdaptor_Surface.hxx>
 #include <gp_Ax1.hxx>
@@ -26,11 +29,13 @@
 #include <gp_Cone.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Lin.hxx>
+#include <gp_Lin2d.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Torus.hxx>
 #include <IntCurveSurface_HInter.hxx>
 #include <IntCurveSurface_IntersectionPoint.hxx>
+#include <IntRes2d_IntersectionSegment.hxx>
 #include <IntTools.hxx>
 #include <IntTools_BeanFaceIntersector.hxx>
 #include <IntTools_CommonPrt.hxx>
@@ -41,10 +46,111 @@
 #include <Precision.hxx>
 
 #include <algorithm>
+#include <vector>
 static bool IsCoplanar(const BRepAdaptor_Curve&, const BRepAdaptor_Surface&);
 static bool IsRadius(const BRepAdaptor_Curve&   aCurve,
                      const BRepAdaptor_Surface& aSurface,
                      const double               aCriteria);
+
+//! For an edge with a 2D curve on the B-spline or Bezier surface of the face, i.e. lying on that
+//! surface, computes the ranges of the edge inside the UV bounds of the face widened by theTol:
+//! the ranges the bean intersector finds by a search over the surface, which takes seconds.
+//! Returns false if the edge has no such 2D curve.
+static bool OnSurfaceRanges(const TopoDS_Edge&                    theEdge,
+                            const TopoDS_Face&                    theFace,
+                            const BRepAdaptor_Surface&            theSurface,
+                            const IntTools_Range&                 theRange,
+                            const double                          theTol,
+                            NCollection_Sequence<IntTools_Range>& theRanges)
+{
+  const GeomAbs_SurfaceType aType = theSurface.GetType();
+  if ((aType != GeomAbs_BSplineSurface && aType != GeomAbs_BezierSurface)
+      || theSurface.IsUPeriodic() || theSurface.IsVPeriodic())
+  {
+    return false;
+  }
+  TopLoc_Location                  aLoc;
+  const occ::handle<Geom_Surface>& aSurface = BRep_Tool::Surface(theFace, aLoc);
+  double                           aFirst, aLast;
+  const occ::handle<Geom2d_Curve>  aC2d =
+    BRep_Tool::CurveOnSurface(theEdge, aSurface, aLoc, aFirst, aLast);
+  if (aC2d.IsNull())
+  {
+    return false;
+  }
+
+  const double aT1 = theRange.First();
+  const double aT2 = theRange.Last();
+  if (aT2 - aT1 < Precision::PConfusion())
+  {
+    return false;
+  }
+  const double aU1      = theSurface.FirstUParameter() - theSurface.UResolution(theTol);
+  const double aU2      = theSurface.LastUParameter() + theSurface.UResolution(theTol);
+  const double aV1      = theSurface.FirstVParameter() - theSurface.VResolution(theTol);
+  const double aV2      = theSurface.LastVParameter() + theSurface.VResolution(theTol);
+  auto         isInside = [&](const double theT) {
+    const gp_Pnt2d aP = aC2d->Value(theT);
+    return aP.X() >= aU1 && aP.X() <= aU2 && aP.Y() >= aV1 && aP.Y() <= aV2;
+  };
+
+  // The parameters where the curve meets the bounds split it into the parts inside and outside
+  std::vector<double>             aParams{aT1, aT2};
+  const occ::handle<Geom2d_Curve> aTrimmed = new Geom2d_TrimmedCurve(aC2d, aT1, aT2);
+  for (const gp_Lin2d& aBound : {gp_Lin2d(gp_Pnt2d(aU1, 0.), gp::DY2d()),
+                                 gp_Lin2d(gp_Pnt2d(aU2, 0.), gp::DY2d()),
+                                 gp_Lin2d(gp_Pnt2d(0., aV1), gp::DX2d()),
+                                 gp_Lin2d(gp_Pnt2d(0., aV2), gp::DX2d())})
+  {
+    Geom2dAPI_InterCurveCurve anInter(aTrimmed, new Geom2d_Line(aBound), Precision::PConfusion());
+    const Geom2dInt_GInter&   anInt = anInter.Intersector();
+    for (int i = 1; i <= anInt.NbPoints(); ++i)
+    {
+      aParams.push_back(anInt.Point(i).ParamOnFirst());
+    }
+    for (int i = 1; i <= anInt.NbSegments(); ++i)
+    {
+      const IntRes2d_IntersectionSegment& aSeg = anInt.Segment(i);
+      if (aSeg.HasFirstPoint())
+      {
+        aParams.push_back(aSeg.FirstPoint().ParamOnFirst());
+      }
+      if (aSeg.HasLastPoint())
+      {
+        aParams.push_back(aSeg.LastPoint().ParamOnFirst());
+      }
+    }
+  }
+  for (double& aT : aParams)
+  {
+    aT = std::clamp(aT, aT1, aT2);
+  }
+  std::sort(aParams.begin(), aParams.end());
+
+  // The curve touching the bounds from outside meets the face at a point
+  const double aTolT = Precision::PConfusion();
+  for (size_t i = 0; i < aParams.size(); ++i)
+  {
+    const double aT = aParams[i];
+    if (i + 1 < aParams.size() && aParams[i + 1] - aT > aTolT
+        && isInside(0.5 * (aT + aParams[i + 1])))
+    {
+      if (!theRanges.IsEmpty() && aT - theRanges.Last().Last() < aTolT)
+      {
+        theRanges.ChangeLast().SetLast(aParams[i + 1]);
+      }
+      else
+      {
+        theRanges.Append(IntTools_Range(aT, aParams[i + 1]));
+      }
+    }
+    else if ((theRanges.IsEmpty() || aT - theRanges.Last().Last() > aTolT) && isInside(aT))
+    {
+      theRanges.Append(IntTools_Range(aT, aT));
+    }
+  }
+  return true;
+}
 
 //=================================================================================================
 
@@ -562,26 +668,38 @@ void IntTools_EdgeFace::Perform()
     }
   }
   //
-  IntTools_BeanFaceIntersector anIntersector(myC, myS, aTolE, aTolF);
-  anIntersector.SetBeanParameters(myRange.First(), myRange.Last());
-  //
-  anIntersector.SetContext(myContext);
-  //
-  anIntersector.Perform();
-
-  if (anIntersector.MinimalSquareDistance() < RealLast())
+  NCollection_Sequence<IntTools_Range> aRanges;
+  if (OnSurfaceRanges(myEdge, myFace, myS, myRange, aTolE + aTolF, aRanges))
   {
-    myMinDistance = std::sqrt(anIntersector.MinimalSquareDistance());
+    if (!aRanges.IsEmpty())
+    {
+      myMinDistance = 0.;
+    }
+  }
+  else
+  {
+    IntTools_BeanFaceIntersector anIntersector(myC, myS, aTolE, aTolF);
+    anIntersector.SetBeanParameters(myRange.First(), myRange.Last());
+    //
+    anIntersector.SetContext(myContext);
+    //
+    anIntersector.Perform();
+
+    if (anIntersector.MinimalSquareDistance() < RealLast())
+    {
+      myMinDistance = std::sqrt(anIntersector.MinimalSquareDistance());
+    }
+
+    if (!anIntersector.IsDone())
+    {
+      return;
+    }
+    aRanges = anIntersector.Result();
   }
 
-  if (!anIntersector.IsDone())
+  for (int r = 1; r <= aRanges.Length(); r++)
   {
-    return;
-  }
-
-  for (int r = 1; r <= anIntersector.Result().Length(); r++)
-  {
-    const IntTools_Range& aRange = anIntersector.Result().Value(r);
+    const IntTools_Range& aRange = aRanges.Value(r);
 
     if (IsProjectable(IntTools_Tools::IntermediatePoint(aRange.First(), aRange.Last())))
     {

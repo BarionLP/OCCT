@@ -842,17 +842,16 @@ void BOPAlgo_RemoveFeatures::CheckPatchTolerance(const TopoDS_Shape& thePatch,
 //! vanish in the reconstruction of the solid: the intersection collapses such slivers
 static constexpr double THE_SLIVER_WIDTH = 1.e-5;
 
-//! Checks whether every face of the shape is narrower than the given width (its area is
-//! less than the width times the size of its box)
+//! Checks whether every face of the shape is narrower than the given width (twice its area
+//! divided by its perimeter is less than the width)
 static bool IsSliver(const TopoDS_Shape& theShape, const double theMaxWidth)
 {
   for (TopExp_Explorer anExp(theShape, TopAbs_FACE); anExp.More(); anExp.Next())
   {
-    Bnd_Box aBox;
-    BRepBndLib::AddOptimal(anExp.Current(), aBox, false, false);
-    GProp_GProps aProps;
-    BRepGProp::SurfaceProperties(anExp.Current(), aProps);
-    if (!aBox.IsVoid() && aProps.Mass() >= theMaxWidth * sqrt(aBox.SquareExtent()))
+    GProp_GProps anArea, aPerimeter;
+    BRepGProp::SurfaceProperties(anExp.Current(), anArea);
+    BRepGProp::LinearProperties(anExp.Current(), aPerimeter);
+    if (2. * anArea.Mass() >= theMaxWidth * aPerimeter.Mass())
     {
       return false;
     }
