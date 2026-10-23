@@ -64,6 +64,7 @@ public: //! @name Constructors
         myFuzzyValue(0.0),
         myIsLocalExtension(false),
         myIsSplineContinuation(false),
+        myIsGapBoundaries(false),
         mySkipGrazing(false),
         myFeatureSize(0.0),
         myHasAdjacentFaces(false),
@@ -116,6 +117,11 @@ public: //! @name Setters/Getters
   //! Defines whether all adjacent faces on non-rational B-spline surfaces are extended by
   //! continuing the polynomials of their end spans (see ContinuedFace), not only the islands
   void SetSplineContinuation(const bool theIsOn) { myIsSplineContinuation = theIsOn; }
+
+  //! Defines whether a boundary between tangent faces extended from a single end is checked
+  //! against the other face only inside the box of the feature: beyond the gap it may run
+  //! past the end of the other face (see RecoverTangentBoundaries)
+  void SetGapBoundaries(const bool theIsOn) { myIsGapBoundaries = theIsOn; }
 
   //! Defines whether the gap is left unfilled when the adjacent faces meet each other at
   //! grazing angles inside it (see FindGrazingPairs)
@@ -2309,7 +2315,9 @@ private: //! @name Private methods performing the operation
 
       // The extension lies on the carrier exactly; make sure it lies on the other face
       // as well, within the tolerance
-      const double aDist = MaxDistanceToFace(anExtension, TopoDS::Face(*pFOtherExt));
+      const double aDist = MaxDistanceToFace(anExtension,
+                                             TopoDS::Face(*pFOtherExt),
+                                             myIsGapBoundaries ? &theFeatureBox : nullptr);
       if (aDist > THE_MAX_DEVIATION * theMaxLength)
       {
         continue;
@@ -2557,8 +2565,10 @@ private: //! @name Private methods performing the operation
   }
 
   //! Computes the greatest distance of the points of the edge to the surface of the
-  //! face within its parametric domain
-  static double MaxDistanceToFace(const TopoDS_Edge& theE, const TopoDS_Face& theF)
+  //! face within its parametric domain, of the points inside the box only if one is given
+  static double MaxDistanceToFace(const TopoDS_Edge& theE,
+                                  const TopoDS_Face& theF,
+                                  const Bnd_Box*     theBox)
   {
     occ::handle<Geom_Surface> aS = BRep_Tool::Surface(theF);
     double                    aF, aL;
@@ -2572,7 +2582,11 @@ private: //! @name Private methods performing the operation
     double aDist = 0.0;
     for (int i = 0; i <= THE_NB_DISTANCE_SAMPLES; ++i)
     {
-      const gp_Pnt               aP = aC->Value(aF + (aL - aF) * i / THE_NB_DISTANCE_SAMPLES);
+      const gp_Pnt aP = aC->Value(aF + (aL - aF) * i / THE_NB_DISTANCE_SAMPLES);
+      if (theBox && theBox->IsOut(aP))
+      {
+        continue;
+      }
       GeomAPI_ProjectPointOnSurf aProj(aP, aS, aU1, aU2, aV1, aV2, Precision::Confusion());
       if (!aProj.IsDone() || aProj.NbPoints() == 0)
       {
@@ -3052,6 +3066,7 @@ private: //! @name Fields
   double myFuzzyValue;                    //!< Fuzzy value for the intersections
   bool myIsLocalExtension;                //!< Extend each face by the size of the feature faces it borders
   bool myIsSplineContinuation;            //!< Continue the spans of all B-spline faces
+  bool myIsGapBoundaries;                 //!< Check the extended boundaries inside the box of the feature only
   bool mySkipGrazing;                     //!< Leave the gap unfilled when the adjacent faces graze each other
   TopoDS_Shape myFeature;                             //!< Feature to remove
   NCollection_IndexedDataMap<TopoDS_Shape, NCollection_List<TopoDS_Shape>, TopTools_ShapeMapHasher>* myEFMap; //!< EF Connection map to find adjacent faces

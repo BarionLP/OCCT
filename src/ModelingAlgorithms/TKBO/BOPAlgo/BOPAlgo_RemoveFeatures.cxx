@@ -583,7 +583,7 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
       return;
     }
     const TopoDS_Shape&   anInputFeature = itF.Value();
-    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 6);
+    Message_ProgressScope aPSFeature(aPSLoop.Next(), nullptr, 8);
 
     if (!isMapsValid)
     {
@@ -765,6 +765,44 @@ void BOPAlgo_RemoveFeatures::RemoveFeatures(const Message_ProgressRange& theRang
                          aFGSpline.Faces(),
                          aFGSpline.AnchoredFaces(),
                          aFGSpline.History(),
+                         HasHistory(),
+                         aPSFeature.Next()))
+    {
+      aOnRemoved();
+      continue;
+    }
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
+
+    // A boundary between tangent faces extended from a single end runs on past the gap, where
+    // the other face may end: checked against it on its whole length the boundary is rejected
+    // and the cut it makes is missing. Retry with the boundaries checked inside the box of the
+    // feature only; tried last, since the other attempts need such rejections to extend the
+    // faces further.
+    FillGap aFGGap;
+    aFGGap.SetFeature(aFeature);
+    aFGGap.SetEFConnectionMap(anEFMap);
+    aFGGap.SetFSConnectionMap(anFSMap);
+    aFGGap.SetRunParallel(myRunParallel);
+    aFGGap.SetFuzzyValue(myFuzzyValue);
+    aFGGap.SetOriginalFaces(anOrigins);
+    aFGGap.SetToSkipGrazing(mySkipGrazingFeatures);
+    aFGGap.SetGapBoundaries(true);
+    aFGGap.SetRange(aPSFeature.Next());
+    aFGGap.Perform();
+    if (UserBreak(aPSFeature))
+    {
+      return;
+    }
+    if (!aFGGap.IsGrazing()
+        && RemoveFeature(aFGGap.Solids(),
+                         aFGGap.FeatureFacesMap(),
+                         aFGGap.HasAdjacentFaces(),
+                         aFGGap.Faces(),
+                         aFGGap.AnchoredFaces(),
+                         aFGGap.History(),
                          HasHistory(),
                          aPSFeature.Next()))
     {
