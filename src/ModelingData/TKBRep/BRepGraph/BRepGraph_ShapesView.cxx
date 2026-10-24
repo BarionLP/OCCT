@@ -33,6 +33,7 @@
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Iterator.hxx>
 
+#include <mutex>
 #include <shared_mutex>
 
 namespace

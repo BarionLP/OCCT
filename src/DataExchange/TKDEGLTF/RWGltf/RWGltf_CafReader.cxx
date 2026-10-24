@@ -33,6 +33,8 @@
 #include <XCAFDoc_ShapeMapTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 
+#include <mutex>
+
 IMPLEMENT_STANDARD_RTTIEXT(RWGltf_CafReader, RWMesh_CafReader)
 
 //! Abstract base functor for parallel execution of glTF data loading.

@@ -27,6 +27,7 @@ SOFTWARE.
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 
 // gcc 4.9 for Android doesn't have search.h
 #if !defined(__ANDROID__) || defined(__clang__)

@@ -51,6 +51,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
 
 #include "../BRepGraphInc/BRepGraphInc_WireOrder.pxx"
